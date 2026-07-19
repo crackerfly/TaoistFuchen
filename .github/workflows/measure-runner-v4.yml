@@ -19,7 +19,7 @@ jobs:
           set -Eeuo pipefail
           umask 077
 
-          out=runner-isolation-v3
+          out=runner-isolation-v4
           mkdir -m 0700 -- "$out"
 
           set +e
@@ -38,7 +38,7 @@ jobs:
             repo_root=$(/usr/bin/readlink -f -- "$GITHUB_WORKSPACE")
             temp_root=$(/usr/bin/readlink -f -- "$RUNNER_TEMP")
             host_user=$(/usr/bin/readlink /proc/self/ns/user)
-            work_root="$temp_root/taoistfuchen-isolation-v3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            work_root="$temp_root/taoistfuchen-isolation-v4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             sdk_fixture="$work_root/sdk-fixture"
             sdk_sibling="$work_root/sdk-writable-sibling"
             m5_root="$work_root/m5-disposable"
@@ -253,9 +253,10 @@ jobs:
             make_m5_case() {
               name=$1
               candidate="$m5_root/$name"
-              /usr/bin/mkdir -m 0700 -- "$candidate"
-              /usr/bin/mkdir -m 0700 -- "$candidate/selected" "$candidate/sibling"
-              /usr/bin/mkdir -m 0700 -- "$candidate/selected/mnt"
+              /usr/bin/mkdir -m 0701 -- "$candidate"
+              /usr/bin/mkdir -m 0703 -- "$candidate/selected"
+              /usr/bin/mkdir -m 0700 -- "$candidate/sibling"
+              /usr/bin/mkdir -m 0701 -- "$candidate/selected/mnt"
               /usr/bin/printf 'input\n' >"$candidate/selected/input"
               active_m5_parent_devino=$(/usr/bin/stat -Lc '%d:%i' -- "$m5_root")
               active_m5_case_devino=$(/usr/bin/stat -Lc '%d:%i' -- "$candidate")
@@ -543,14 +544,8 @@ jobs:
               >"$sdk_diagnostics/inner-started.txt"
             /usr/bin/mkdir -m 0700 -- "$sdk_fixture" "$sdk_sibling"
             /usr/bin/printf 'runner-owned input\n' >"$sdk_fixture/input"
-            exec 63<>"/dev/tcp/127.0.0.1/$listener_port"
-            set +e
-            /usr/bin/sudo -n -- /usr/bin/unshare \
-              --mount --net --mount-proc=/proc --propagation private \
-              --setgid "$gid" --setuid "$uid" -- \
-              /usr/bin/setpriv \
-                --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
-              /bin/sh -u -c '
+            sdk_inner_script="$sdk_diagnostics/probe.sh"
+            /usr/bin/cat >"$sdk_inner_script" <<'SDK_INNER'
                 expected_uid=$1
                 expected_gid=$2
                 expected_net=$3
@@ -692,12 +687,12 @@ jobs:
                 /usr/bin/printf 'expected runner-writable sibling\n' >"$sibling/proof"
                 record SDK_SIBLING_WRITE_EXPECTED $?
                 /usr/bin/python3 -c \
-                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)'"'"' \
+                  'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)' \
                   127.0.0.1 "$listener_port" \
                   >"$diagnostics/loopback-connect.txt" 2>&1
                 record SDK_PARENT_LISTENER_BLOCKED $?
                 /usr/bin/python3 -c \
-                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)'"'"' \
+                  'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)' \
                   1.1.1.1 443 >"$diagnostics/public-connect.txt" 2>&1
                 record SDK_PUBLIC_NETWORK_BLOCKED $?
                 /usr/bin/sudo -n -- /usr/bin/id -u \
@@ -715,7 +710,22 @@ jobs:
                 /usr/bin/printf 'NSENTER_REGAIN_STATUS=%s\n' "$nsenter_regain_status" \
                   >>"$diagnostics/checks.txt"
                 exit "$failed"
-              ' probe "$uid" "$gid" "$host_net" "$host_mnt" "$host_user" \
+          SDK_INNER
+            /bin/chmod 0500 -- "$sdk_inner_script"
+            [ -f "$sdk_inner_script" ]
+            [ ! -L "$sdk_inner_script" ]
+            [ "$(/usr/bin/stat -Lc '%u:%g:%a' -- "$sdk_inner_script")" = \
+              "$uid:$gid:500" ]
+            /bin/sh -n -- "$sdk_inner_script"
+            exec 63<>"/dev/tcp/127.0.0.1/$listener_port"
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/unshare \
+              --mount --net --mount-proc=/proc --propagation private \
+              --setgid "$gid" --setuid "$uid" -- \
+              /usr/bin/setpriv \
+                --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
+              /bin/sh -u "$sdk_inner_script" \
+                "$uid" "$gid" "$host_net" "$host_mnt" "$host_user" \
                 "$sdk_fixture" "$sdk_sibling" "$listener_port" "$host_pid" 63 \
                 "$sdk_diagnostics"
             sdk_main_status=$?
@@ -833,7 +843,8 @@ jobs:
             } >"$PWD/$out/sdk-result.txt"
 
             printf '%s\n' '=== M5 EMPTY-ROOT BWRAP PROBES ==='
-            /usr/bin/mkdir -m 0700 -- "$m5_root"
+            /bin/chmod 0701 -- "$work_root"
+            /usr/bin/mkdir -m 0701 -- "$m5_root"
             m5_probe_script=
             read -r -d '' m5_probe_script <<'M5_PROBE' || true
           set -eu
@@ -1128,7 +1139,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: taoistfuchen-ubuntu-24.04-isolation-v3
-          path: runner-isolation-v3/
+          name: taoistfuchen-ubuntu-24.04-isolation-v4
+          path: runner-isolation-v4/
           if-no-files-found: error
           retention-days: 7
