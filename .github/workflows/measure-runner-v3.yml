@@ -1,4 +1,4 @@
-name: Probe TaoistFuchen hybrid isolation on ubuntu-24.04
+name: Diagnose TaoistFuchen hybrid isolation on ubuntu-24.04
 
 'on':
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   probe:
-    name: Probe sudo-unshare and pinned Bubblewrap
+    name: Diagnose sudo-unshare and pinned Bubblewrap
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -19,7 +19,7 @@ jobs:
           set -Eeuo pipefail
           umask 077
 
-          out=runner-isolation-v2
+          out=runner-isolation-v3
           mkdir -m 0700 -- "$out"
 
           set +e
@@ -38,7 +38,7 @@ jobs:
             repo_root=$(/usr/bin/readlink -f -- "$GITHUB_WORKSPACE")
             temp_root=$(/usr/bin/readlink -f -- "$RUNNER_TEMP")
             host_user=$(/usr/bin/readlink /proc/self/ns/user)
-            work_root="$temp_root/taoistfuchen-isolation-v2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            work_root="$temp_root/taoistfuchen-isolation-v3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             sdk_fixture="$work_root/sdk-fixture"
             sdk_sibling="$work_root/sdk-writable-sibling"
             m5_root="$work_root/m5-disposable"
@@ -127,7 +127,7 @@ jobs:
                 wait "$listener_pid" 2>/dev/null
               fi
               if [ -n "$active_m5_case" ]; then
-                if cleanup_m5_case "$active_m5_case"; then
+                if safe_cleanup_m5_case "$active_m5_case"; then
                   active_m5_case=
                 else
                   cleanup_rc=$?
@@ -139,8 +139,10 @@ jobs:
                   [ ! -e "$work_root" ] || cleanup_rc=1
                 fi
               fi
-              if [ "$rc" -eq 0 ] && [ "$cleanup_rc" -ne 0 ]; then
-                rc=$cleanup_rc
+              if [ "$cleanup_rc" -ne 0 ]; then
+                printf 'CLEANUP_FATAL_STATUS=%s ORIGINAL_STATUS=%s\n' \
+                  "$cleanup_rc" "$rc"
+                rc=200
               fi
               exit "$rc"
             }
@@ -235,6 +237,19 @@ jobs:
               done
             }
 
+            safe_cleanup_m5_case() {
+              candidate=$1
+              wait_for_no_bwrap || {
+                printf 'CLEANUP_ERROR=Bubblewrap helper still active for %s\n' "$candidate"
+                return 1
+              }
+              if /usr/bin/grep -F -- "$candidate" /proc/self/mountinfo >/dev/null; then
+                printf 'CLEANUP_ERROR=host mount still references %s\n' "$candidate"
+                return 1
+              fi
+              cleanup_m5_case "$candidate" || return 1
+            }
+
             make_m5_case() {
               name=$1
               candidate="$m5_root/$name"
@@ -250,18 +265,50 @@ jobs:
             finish_m5_case() {
               selected=$1
               proof=$2
-              [ -f "$selected/$proof" ]
-              owner=$(/usr/bin/stat -Lc '%u:%g' -- "$selected/$proof")
-              printf 'M5_OUTER_OWNER=%s PATH=%s\n' "$owner" "$selected/$proof"
-              [ "$owner" = '0:0' ]
+              proof_status=0
+              if [ -f "$selected/$proof" ]; then
+                owner=$(/usr/bin/stat -Lc '%u:%g' -- "$selected/$proof") || proof_status=1
+                printf 'M5_OUTER_OWNER=%s PATH=%s\n' "${owner-UNKNOWN}" "$selected/$proof"
+                [ "${owner-}" = '0:0' ] || proof_status=1
+              else
+                printf 'M5_PROOF_MISSING=%s\n' "$selected/$proof"
+                proof_status=1
+              fi
               case_path=$active_m5_case
-              cleanup_m5_case "$case_path"
+              safe_cleanup_m5_case "$case_path" || return 2
               active_m5_case=
               active_m5_case_devino=
               active_m5_parent_devino=
-              [ ! -e "$case_path" ]
-              ! /usr/bin/grep -F -- "$case_path" /proc/self/mountinfo >/dev/null
-              wait_for_no_bwrap
+              [ ! -e "$case_path" ] || return 1
+              return "$proof_status"
+            }
+
+            finalize_m5_lane() {
+              lane_name=$1
+              selected=$2
+              proof=$3
+              invocation_ok=$4
+              if finish_m5_case "$selected" "$proof"; then
+                finish_status=0
+              else
+                finish_status=$?
+              fi
+              if [ "$finish_status" -eq 2 ]; then
+                printf 'M5_%s_CLEANUP=FAIL\n' "$lane_name" >>"$m5_result"
+                return 2
+              fi
+              printf 'M5_%s_CLEANUP=PASS\n' "$lane_name" >>"$m5_result"
+              if [ "$finish_status" -eq 0 ]; then
+                printf 'M5_%s_PROOF=PASS\n' "$lane_name" >>"$m5_result"
+              else
+                printf 'M5_%s_PROOF=FAIL\n' "$lane_name" >>"$m5_result"
+              fi
+              if [ "$invocation_ok" -eq 1 ] && [ "$finish_status" -eq 0 ]; then
+                printf 'M5_%s_RESULT=PASS\n' "$lane_name" >>"$m5_result"
+                return 0
+              fi
+              printf 'M5_%s_RESULT=FAIL\n' "$lane_name" >>"$m5_result"
+              return 1
             }
 
             run_m5_bwrap() {
@@ -320,27 +367,9 @@ jobs:
 
             printf '%s\n' '=== SUDO AUTHORITY / POLICY ==='
             /usr/bin/sudo -V >"$PWD/$out/sudo-version.txt" 2>&1
-            /usr/bin/sudo -n -l >"$PWD/$out/sudo-list.txt" 2>&1
             /usr/bin/sudo -n -- /usr/bin/true
             /usr/bin/sudo -n -- /usr/bin/id -u >"$PWD/$out/sudo-root-id.txt"
             [ "$(/usr/bin/cat "$PWD/$out/sudo-root-id.txt")" = 0 ]
-            : >"$PWD/$out/sudo-config.txt"
-            while IFS= read -r config_path; do
-              [ -n "$config_path" ] || continue
-              /usr/bin/sudo -n -- /usr/bin/stat -Lc \
-                '%n MODE=%a UID=%u GID=%g SIZE=%s' -- "$config_path" \
-                >>"$PWD/$out/sudo-config.txt"
-              /usr/bin/sudo -n -- /usr/bin/sha256sum -- "$config_path" \
-                >>"$PWD/$out/sudo-config.txt"
-            done < <(
-              {
-                [ ! -f /etc/sudo.conf ] || /usr/bin/printf '%s\n' /etc/sudo.conf
-                [ ! -f /etc/sudoers ] || /usr/bin/printf '%s\n' /etc/sudoers
-                if [ -d /etc/sudoers.d ]; then
-                  /usr/bin/find /etc/sudoers.d -type f -print
-                fi
-              } | LC_ALL=C /usr/bin/sort -u
-            )
             set +e
             LD_LIBRARY_PATH=/taoistfuchen-denied \
             LD_PRELOAD=/taoistfuchen-denied.so \
@@ -502,18 +531,26 @@ jobs:
               'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' \
               "$listener_port"
 
+            set +e
+            (
+            set -Eeuo pipefail
             printf '%s\n' '=== SDK SUDO-UNSHARE/SETPRIV PROBE ==='
             [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ne 0 ]
             [[ "$gid" =~ ^[0-9]+$ ]] && [ "$gid" -ne 0 ]
+            sdk_diagnostics="$PWD/$out/sdk-inner"
+            /usr/bin/mkdir -m 0700 -- "$sdk_diagnostics"
+            /usr/bin/printf '%s\n' 'SDK_INNER_STARTED=NO' \
+              >"$sdk_diagnostics/inner-started.txt"
             /usr/bin/mkdir -m 0700 -- "$sdk_fixture" "$sdk_sibling"
             /usr/bin/printf 'runner-owned input\n' >"$sdk_fixture/input"
             exec 63<>"/dev/tcp/127.0.0.1/$listener_port"
+            set +e
             /usr/bin/sudo -n -- /usr/bin/unshare \
               --mount --net --mount-proc=/proc --propagation private \
               --setgid "$gid" --setuid "$uid" -- \
               /usr/bin/setpriv \
                 --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
-              /bin/sh -eu -c '
+              /bin/sh -u -c '
                 expected_uid=$1
                 expected_gid=$2
                 expected_net=$3
@@ -524,6 +561,52 @@ jobs:
                 listener_port=$8
                 parent_pid=$9
                 inherited_fd=${10}
+                diagnostics=${11}
+                failed=0
+
+                /usr/bin/printf '%s\n' 'SDK_INNER_STARTED=YES' \
+                  >"$diagnostics/inner-started.txt"
+
+                record() {
+                  check_name=$1
+                  check_status=$2
+                  if [ "$check_status" -eq 0 ]; then
+                    check_result=PASS
+                  else
+                    check_result=FAIL
+                    failed=1
+                  fi
+                  /usr/bin/printf "%s=%s\n" "$check_name" "$check_result"
+                  if ! /usr/bin/printf "%s=%s\n" "$check_name" "$check_result" \
+                    >>"$diagnostics/checks.txt"
+                  then
+                    failed=1
+                    /usr/bin/printf 'SDK_EVIDENCE_WRITE=FAIL name=%s\n' "$check_name"
+                  fi
+                  return 0
+                }
+
+                : >"$diagnostics/checks.txt"
+                /usr/bin/id -a >"$diagnostics/id.txt" 2>&1
+                record SDK_SNAPSHOT_ID $?
+                /usr/bin/cat /proc/self/status >"$diagnostics/status.txt"
+                record SDK_SNAPSHOT_STATUS $?
+                {
+                  /usr/bin/printf "net="
+                  /usr/bin/readlink /proc/self/ns/net
+                  /usr/bin/printf "mnt="
+                  /usr/bin/readlink /proc/self/ns/mnt
+                  /usr/bin/printf "user="
+                  /usr/bin/readlink /proc/self/ns/user
+                } >"$diagnostics/namespaces.txt" 2>&1
+                record SDK_SNAPSHOT_NAMESPACES $?
+                /usr/bin/findmnt -no FSTYPE,OPTIONS /proc \
+                  >"$diagnostics/proc-mount.txt" 2>&1
+                record SDK_SNAPSHOT_PROC_MOUNT $?
+                /usr/bin/cat /proc/net/route >"$diagnostics/ipv4-route.txt"
+                record SDK_SNAPSHOT_IPV4_ROUTE $?
+                /usr/bin/cat /proc/net/ipv6_route >"$diagnostics/ipv6-route.txt"
+                record SDK_SNAPSHOT_IPV6_ROUTE $?
 
                 uid_ok=0
                 gid_ok=0
@@ -551,60 +634,152 @@ jobs:
                     NoNewPrivs:) [ "$a" = 1 ] && nnp_ok=1 ;;
                   esac
                 done </proc/self/status
-                [ "$uid_ok$gid_ok$groups_ok$cap_inh_ok$cap_prm_ok$cap_eff_ok$cap_amb_ok$nnp_ok" = 11111111 ]
+                [ "$uid_ok" = 1 ]
+                record SDK_STATUS_UID $?
+                [ "$gid_ok" = 1 ]
+                record SDK_STATUS_GID $?
+                [ "$groups_ok" = 1 ]
+                record SDK_STATUS_GROUPS $?
+                [ "$cap_inh_ok" = 1 ]
+                record SDK_STATUS_CAP_INH $?
+                [ "$cap_prm_ok" = 1 ]
+                record SDK_STATUS_CAP_PRM $?
+                [ "$cap_eff_ok" = 1 ]
+                record SDK_STATUS_CAP_EFF $?
+                [ "$cap_amb_ok" = 1 ]
+                record SDK_STATUS_CAP_AMB $?
+                [ "$nnp_ok" = 1 ]
+                record SDK_STATUS_NNP $?
                 [ "$(/usr/bin/id -u)" = "$expected_uid" ]
+                record SDK_ID_UID $?
                 [ "$(/usr/bin/id -g)" = "$expected_gid" ]
+                record SDK_ID_GID $?
                 [ "$(/usr/bin/id -G)" = "$expected_gid" ]
+                record SDK_ID_GROUPS $?
                 [ "$(/usr/bin/readlink /proc/self/ns/net)" != "$expected_net" ]
+                record SDK_NET_NAMESPACE_PRIVATE $?
                 [ "$(/usr/bin/readlink /proc/self/ns/mnt)" != "$expected_mnt" ]
+                record SDK_MOUNT_NAMESPACE_PRIVATE $?
                 [ "$(/usr/bin/readlink /proc/self/ns/user)" = "$expected_user" ]
+                record SDK_USER_NAMESPACE_UNCHANGED $?
                 [ ! -e "/proc/self/fd/$inherited_fd" ]
+                record SDK_INHERITED_FD_CLOSED $?
                 /usr/bin/findmnt -no FSTYPE,OPTIONS /proc |
                   /usr/bin/grep -E "^proc .*(nosuid.*nodev.*noexec|nosuid.*noexec.*nodev|nodev.*nosuid.*noexec|nodev.*noexec.*nosuid|noexec.*nosuid.*nodev|noexec.*nodev.*nosuid)" \
                   >/dev/null
+                record SDK_PROC_MOUNT_HARDENED $?
                 nonloopback_route_count=0
                 while read -r iface destination rest; do
                   [ "$iface" = Iface ] || [ "$iface" = lo ] ||
                     nonloopback_route_count=$((nonloopback_route_count + 1))
                 done </proc/net/route
                 [ "$nonloopback_route_count" -eq 0 ]
+                record SDK_IPV4_NO_NONLOOPBACK_ROUTE $?
                 nonloopback_ipv6_route_count=0
                 while read -r destination prefix source source_prefix next_hop metric ref use flags iface; do
                   [ -z "${iface-}" ] || [ "$iface" = lo ] ||
                     nonloopback_ipv6_route_count=$((nonloopback_ipv6_route_count + 1))
                 done </proc/net/ipv6_route
                 [ "$nonloopback_ipv6_route_count" -eq 0 ]
+                record SDK_IPV6_NO_NONLOOPBACK_ROUTE $?
 
                 /usr/bin/mkdir -p -- "$fixture/nested/deeper"
+                record SDK_FIXTURE_MKDIR $?
                 /usr/bin/printf 'offline write\n' >"$fixture/nested/deeper/output"
+                record SDK_FIXTURE_WRITE $?
                 /usr/bin/sha256sum "$fixture/input" >"$fixture/input.sha256"
+                record SDK_FIXTURE_READ_HASH $?
                 /usr/bin/printf 'expected runner-writable sibling\n' >"$sibling/proof"
-                /usr/bin/cat /proc/net/route >"$fixture/ipv4-route.txt"
-                /usr/bin/cat /proc/net/ipv6_route >"$fixture/ipv6-route.txt"
+                record SDK_SIBLING_WRITE_EXPECTED $?
                 /usr/bin/python3 -c \
-                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) != 0 else 1)'"'"' \
-                  127.0.0.1 "$listener_port"
+                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)'"'"' \
+                  127.0.0.1 "$listener_port" \
+                  >"$diagnostics/loopback-connect.txt" 2>&1
+                record SDK_PARENT_LISTENER_BLOCKED $?
                 /usr/bin/python3 -c \
-                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) != 0 else 1)'"'"' \
-                  1.1.1.1 443
-                if /usr/bin/sudo -n -- /usr/bin/id -u >"$fixture/sudo-regain.txt" 2>&1; then
-                  exit 91
-                fi
-                if /usr/bin/nsenter --net="/proc/$parent_pid/ns/net" /bin/true \
-                  >"$fixture/nsenter-regain.txt" 2>&1; then
-                  exit 92
-                fi
-                /usr/bin/printf 'CapBnd=' >>"$fixture/state.txt"
-                while read -r key value rest; do
-                  [ "$key" != CapBnd: ] || /usr/bin/printf '%s\n' "$value" >>"$fixture/state.txt"
-                done </proc/self/status
+                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); rc=s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(rc); raise SystemExit(0 if rc != 0 else 1)'"'"' \
+                  1.1.1.1 443 >"$diagnostics/public-connect.txt" 2>&1
+                record SDK_PUBLIC_NETWORK_BLOCKED $?
+                /usr/bin/sudo -n -- /usr/bin/id -u \
+                  >"$diagnostics/sudo-regain.txt" 2>&1
+                sudo_regain_status=$?
+                [ "$sudo_regain_status" -ne 0 ]
+                record SDK_SUDO_REGAIN_BLOCKED $?
+                /usr/bin/printf 'SUDO_REGAIN_STATUS=%s\n' "$sudo_regain_status" \
+                  >>"$diagnostics/checks.txt"
+                /usr/bin/nsenter --net="/proc/$parent_pid/ns/net" /bin/true \
+                  >"$diagnostics/nsenter-regain.txt" 2>&1
+                nsenter_regain_status=$?
+                [ "$nsenter_regain_status" -ne 0 ]
+                record SDK_NSENTER_REGAIN_BLOCKED $?
+                /usr/bin/printf 'NSENTER_REGAIN_STATUS=%s\n' "$nsenter_regain_status" \
+                  >>"$diagnostics/checks.txt"
+                exit "$failed"
               ' probe "$uid" "$gid" "$host_net" "$host_mnt" "$host_user" \
-                "$sdk_fixture" "$sdk_sibling" "$listener_port" "$host_pid" 63
+                "$sdk_fixture" "$sdk_sibling" "$listener_port" "$host_pid" 63 \
+                "$sdk_diagnostics"
+            sdk_main_status=$?
+            set -e
             exec 63>&-
+            printf 'SDK_MAIN_STATUS=%s\n' "$sdk_main_status"
+            /usr/bin/printf 'SDK_MAIN_STATUS=%s\n' "$sdk_main_status" \
+              >"$sdk_diagnostics/invocation-status.txt"
 
-            assert_runner_owned_tree "$sdk_fixture"
-            assert_runner_owned_tree "$sdk_sibling"
-            printf '%s\n' 'SDK_WRITABLE_SIBLING=EXPECTED_AND_CONFIRMED'
+            sdk_probe_status=0
+            [ "$sdk_main_status" -eq 0 ] || sdk_probe_status=1
+            for sdk_root in "$sdk_fixture" "$sdk_sibling" "$sdk_diagnostics"; do
+              if [ ! -d "$sdk_root" ]; then
+                printf 'SDK_TREE_MISSING=%s\n' "$sdk_root"
+                sdk_probe_status=1
+                continue
+              fi
+              while IFS= read -r -d '' path; do
+                owner=$(/usr/bin/stat -Lc '%u:%g' -- "$path")
+                printf 'SDK_OWNER=%s %s\n' "$owner" "$path"
+                [ "$owner" = "$uid:$gid" ] || sdk_probe_status=1
+              done < <(/usr/bin/find "$sdk_root" -mindepth 0 -print0)
+            done
+            expected_sdk_checks=(
+              SDK_FIXTURE_MKDIR SDK_FIXTURE_READ_HASH SDK_FIXTURE_WRITE
+              SDK_ID_GID SDK_ID_GROUPS SDK_ID_UID SDK_INHERITED_FD_CLOSED
+              SDK_IPV4_NO_NONLOOPBACK_ROUTE SDK_IPV6_NO_NONLOOPBACK_ROUTE
+              SDK_MOUNT_NAMESPACE_PRIVATE SDK_NET_NAMESPACE_PRIVATE
+              SDK_NSENTER_REGAIN_BLOCKED SDK_PARENT_LISTENER_BLOCKED
+              SDK_PROC_MOUNT_HARDENED SDK_PUBLIC_NETWORK_BLOCKED
+              SDK_SIBLING_WRITE_EXPECTED SDK_SNAPSHOT_ID
+              SDK_SNAPSHOT_IPV4_ROUTE SDK_SNAPSHOT_IPV6_ROUTE
+              SDK_SNAPSHOT_NAMESPACES SDK_SNAPSHOT_PROC_MOUNT
+              SDK_SNAPSHOT_STATUS SDK_STATUS_CAP_AMB SDK_STATUS_CAP_EFF
+              SDK_STATUS_CAP_INH SDK_STATUS_CAP_PRM SDK_STATUS_GID
+              SDK_STATUS_GROUPS SDK_STATUS_NNP SDK_STATUS_UID
+              SDK_SUDO_REGAIN_BLOCKED SDK_USER_NAMESPACE_UNCHANGED
+            )
+            if [ ! -s "$sdk_diagnostics/checks.txt" ]; then
+              sdk_probe_status=1
+              printf '%s\n' 'SDK_EVIDENCE_COMPLETENESS=FAIL empty-or-missing'
+            else
+              actual_sdk_check_count=$(
+                /usr/bin/grep -Ec '^SDK_[A-Z0-9_]+=(PASS|FAIL)$' \
+                  "$sdk_diagnostics/checks.txt"
+              ) || actual_sdk_check_count=0
+              if [ "$actual_sdk_check_count" -ne "${#expected_sdk_checks[@]}" ]; then
+                sdk_probe_status=1
+                printf 'SDK_EVIDENCE_COMPLETENESS=FAIL count=%s expected=%s\n' \
+                  "$actual_sdk_check_count" "${#expected_sdk_checks[@]}"
+              fi
+              for expected_sdk_check in "${expected_sdk_checks[@]}"; do
+                expected_sdk_count=$(
+                  /usr/bin/grep -Ec \
+                    "^${expected_sdk_check}=(PASS|FAIL)$" \
+                    "$sdk_diagnostics/checks.txt"
+                ) || expected_sdk_count=0
+                if [ "$expected_sdk_count" -ne 1 ]; then
+                  sdk_probe_status=1
+                  printf 'SDK_EVIDENCE_KEY=FAIL key=%s count=%s\n' \
+                    "$expected_sdk_check" "$expected_sdk_count"
+                fi
+              done
+            fi
             set +e
             /usr/bin/sudo -n -- /usr/bin/unshare \
               --mount --net --mount-proc=/proc --propagation private \
@@ -623,13 +798,39 @@ jobs:
             set -e
             printf 'SDK_EXIT_STATUS=%s\n' "$sdk_exit_status"
             printf 'SDK_SIGNAL_STATUS=%s\n' "$sdk_signal_status"
-            [ "$sdk_exit_status" -eq 37 ]
-            [ "$sdk_signal_status" -eq 143 ]
-            ! /usr/bin/grep -F -- "$sdk_fixture" /proc/self/mountinfo >/dev/null
-            ! /usr/bin/grep -F -- "$sdk_sibling" /proc/self/mountinfo >/dev/null
+            [ "$sdk_exit_status" -eq 37 ] || sdk_probe_status=1
+            [ "$sdk_signal_status" -eq 143 ] || sdk_probe_status=1
+            if /usr/bin/grep -F -- "$sdk_fixture" /proc/self/mountinfo >/dev/null; then
+              sdk_probe_status=1
+            fi
+            if /usr/bin/grep -F -- "$sdk_sibling" /proc/self/mountinfo >/dev/null; then
+              sdk_probe_status=1
+            fi
+            set +e
             /usr/bin/python3 -c \
               'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' \
               "$listener_port"
+            parent_listener_status=$?
+            set -e
+            [ "$parent_listener_status" -eq 0 ] || sdk_probe_status=1
+            if [ "$sdk_probe_status" -eq 0 ]; then
+              printf '%s\n' 'SDK_ISOLATION_PROBE=PASS'
+            else
+              printf '%s\n' 'SDK_ISOLATION_PROBE=FAIL'
+            fi
+            exit "$sdk_probe_status"
+            )
+            sdk_phase_status=$?
+            set -e
+            sdk_probe_status=$sdk_phase_status
+            {
+              printf 'SDK_PHASE_STATUS=%s\n' "$sdk_phase_status"
+              if [ "$sdk_phase_status" -eq 0 ]; then
+                printf '%s\n' 'SDK_ISOLATION_PROBE=PASS'
+              else
+                printf '%s\n' 'SDK_ISOLATION_PROBE=FAIL'
+              fi
+            } >"$PWD/$out/sdk-result.txt"
 
             printf '%s\n' '=== M5 EMPTY-ROOT BWRAP PROBES ==='
             /usr/bin/mkdir -m 0700 -- "$m5_root"
@@ -648,7 +849,9 @@ jobs:
           expected_net=$9
           expected_uts=${10}
           expected_ipc=${11}
-          
+
+          $bb printf 'M5_INNER_MODE=%s\n' "$mode"
+          $bb printf '%s\n' 'M5_STAGE=identity-and-namespaces'
           [ "$($bb id -u)" = 0 ]
           [ "$($bb id -g)" = 0 ]
           [ "$($bb readlink /proc/self/ns/user)" != "$expected_user" ]
@@ -659,7 +862,8 @@ jobs:
           [ "$($bb readlink /proc/self/ns/ipc)" != "$expected_ipc" ]
           set -- $($bb cat /proc/self/uid_map)
           [ "$1" = 0 ] && [ "$2" = 0 ] && [ "$3" = 1 ]
-          
+
+          $bb printf '%s\n' 'M5_STAGE=capabilities'
           cap_inh=bad
           cap_prm=bad
           cap_eff=bad
@@ -677,6 +881,8 @@ jobs:
             esac
           done </proc/self/status
           [ "$nnp" = 1 ]
+          $bb printf 'M5_CAPS=%s/%s/%s/%s/%s NNP=%s\n' \
+            "$cap_inh" "$cap_prm" "$cap_eff" "$cap_bnd" "$cap_amb" "$nnp"
           case "$mode" in
             zero)
               [ "$cap_inh$cap_prm$cap_eff$cap_bnd$cap_amb" = \
@@ -700,7 +906,8 @@ jobs:
               ;;
             *) exit 112 ;;
           esac
-          
+
+          $bb printf '%s\n' 'M5_STAGE=filesystem-and-userns'
           if $bb unshare -U /bin/busybox true >/tmp/unshare.out 2>&1; then
             exit 113
           fi
@@ -715,6 +922,7 @@ jobs:
           $bb dd if=/dev/urandom of=/tmp/random bs=32 count=1 2>/dev/null
           [ "$($bb stat -c %s /tmp/random)" = 32 ]
           $bb printf 'private tmpfs\n' >/tmp/private-proof
+          $bb printf '%s\n' 'M5_STAGE=network'
           route_count=0
           while read -r iface destination rest; do
             [ "$iface" = Iface ] || route_count=$((route_count + 1))
@@ -728,33 +936,80 @@ jobs:
           fi
           ! $bb grep -F "$repo" /proc/self/mountinfo >/dev/null
           ! $bb grep -F "$sibling" /proc/self/mountinfo >/dev/null
+          $bb printf '%s\n' 'M5_STAGE=evidence-and-proof'
           $bb cat /proc/self/status >"/fixture/status-$mode.txt"
           $bb cat /proc/self/mountinfo >"/fixture/mountinfo-$mode.txt"
           $bb printf 'root-owned disposable proof\n' >"/fixture/$mode-proof"
           M5_PROBE
+
+            m5_probe_status=0
+            m5_result="$PWD/$out/m5-result.txt"
+            : >"$m5_result"
+            printf '%s\n' 'M5_PHASE_STARTED=YES' >>"$m5_result"
 
             printf '%s\n' '=== M5 ZERO-CAPABILITY LANE ==='
             make_m5_case zero
             zero_case=$active_m5_case
             zero_selected="$zero_case/selected"
             zero_sibling="$zero_case/sibling"
+            set +e
             run_m5_bwrap zero "$zero_selected" \
               /bin/busybox sh -eu -c "$m5_probe_script" probe \
               zero "$listener_port" "$parent_socket" "$repo_root" "$zero_sibling" \
               "$host_user" "$host_mnt" "$host_pidns" "$host_net" "$host_uts" "$host_ipc"
-            finish_m5_case "$zero_selected" zero-proof
+            zero_status=$?
+            set -e
+            printf 'M5_ZERO_STATUS=%s\n' "$zero_status"
+            printf 'M5_ZERO_STATUS=%s\n' "$zero_status" >>"$m5_result"
+            if [ "$zero_status" -eq 0 ]; then
+              zero_invocation_ok=1
+            else
+              zero_invocation_ok=0
+            fi
+            set +e
+            finalize_m5_lane ZERO "$zero_selected" zero-proof "$zero_invocation_ok"
+            zero_finalize_status=$?
+            set -e
+            case "$zero_finalize_status" in
+              0) printf '%s\n' 'M5_ZERO_RESULT=PASS' ;;
+              1)
+                m5_probe_status=1
+                printf '%s\n' 'M5_ZERO_RESULT=FAIL'
+                ;;
+              *) exit 121 ;;
+            esac
 
             printf '%s\n' '=== M5 MOUNT-CAPABILITY LANE ==='
             make_m5_case mount
             mount_case=$active_m5_case
             mount_selected="$mount_case/selected"
             mount_sibling="$mount_case/sibling"
+            set +e
             run_m5_bwrap mount "$mount_selected" \
               /bin/busybox sh -eu -c "$m5_probe_script" probe \
               mount "$listener_port" "$parent_socket" "$repo_root" "$mount_sibling" \
               "$host_user" "$host_mnt" "$host_pidns" "$host_net" "$host_uts" "$host_ipc"
-            [ ! -e "$mount_selected/mnt/private" ]
-            finish_m5_case "$mount_selected" mount-proof
+            mount_status=$?
+            set -e
+            printf 'M5_MOUNT_STATUS=%s\n' "$mount_status"
+            printf 'M5_MOUNT_STATUS=%s\n' "$mount_status" >>"$m5_result"
+            if [ "$mount_status" -eq 0 ] && [ ! -e "$mount_selected/mnt/private" ]; then
+              mount_invocation_ok=1
+            else
+              mount_invocation_ok=0
+            fi
+            set +e
+            finalize_m5_lane MOUNT "$mount_selected" mount-proof "$mount_invocation_ok"
+            mount_finalize_status=$?
+            set -e
+            case "$mount_finalize_status" in
+              0) printf '%s\n' 'M5_MOUNT_RESULT=PASS' ;;
+              1)
+                m5_probe_status=1
+                printf '%s\n' 'M5_MOUNT_RESULT=FAIL'
+                ;;
+              *) exit 123 ;;
+            esac
 
             printf '%s\n' '=== M5 CHILD-FAILURE CLEANUP ==='
             make_m5_case failure
@@ -767,8 +1022,25 @@ jobs:
             failure_status=$?
             set -e
             printf 'M5_FAILURE_STATUS=%s\n' "$failure_status"
-            [ "$failure_status" -eq 23 ]
-            finish_m5_case "$failure_selected" failure-proof
+            printf 'M5_FAILURE_STATUS=%s\n' "$failure_status" >>"$m5_result"
+            if [ "$failure_status" -eq 23 ]; then
+              failure_invocation_ok=1
+            else
+              failure_invocation_ok=0
+            fi
+            set +e
+            finalize_m5_lane FAILURE "$failure_selected" failure-proof \
+              "$failure_invocation_ok"
+            failure_finalize_status=$?
+            set -e
+            case "$failure_finalize_status" in
+              0) printf '%s\n' 'M5_FAILURE_RESULT=PASS' ;;
+              1)
+                m5_probe_status=1
+                printf '%s\n' 'M5_FAILURE_RESULT=FAIL'
+                ;;
+              *) exit 125 ;;
+            esac
 
             printf '%s\n' '=== M5 TIMEOUT CLEANUP ==='
             make_m5_case timeout
@@ -797,10 +1069,38 @@ jobs:
             timeout_status=$?
             set -e
             printf 'M5_TIMEOUT_STATUS=%s\n' "$timeout_status"
-            [ "$timeout_status" -eq 124 ] || [ "$timeout_status" -eq 137 ]
-            finish_m5_case "$timeout_selected" timeout-proof
+            printf 'M5_TIMEOUT_STATUS=%s\n' "$timeout_status" >>"$m5_result"
+            if [ "$timeout_status" -eq 124 ] || [ "$timeout_status" -eq 137 ]; then
+              timeout_invocation_ok=1
+            else
+              timeout_invocation_ok=0
+            fi
+            set +e
+            finalize_m5_lane TIMEOUT "$timeout_selected" timeout-proof \
+              "$timeout_invocation_ok"
+            timeout_finalize_status=$?
+            set -e
+            case "$timeout_finalize_status" in
+              0) printf '%s\n' 'M5_TIMEOUT_RESULT=PASS' ;;
+              1)
+                m5_probe_status=1
+                printf '%s\n' 'M5_TIMEOUT_RESULT=FAIL'
+                ;;
+              *) exit 127 ;;
+            esac
 
             /bin/rmdir -- "$m5_root"
+            if [ "$m5_probe_status" -eq 0 ]; then
+              printf '%s\n' 'M5_ISOLATION_PROBE=PASS'
+              printf '%s\n' 'M5_ISOLATION_PROBE=PASS' >>"$m5_result"
+            else
+              printf '%s\n' 'M5_ISOLATION_PROBE=FAIL'
+              printf '%s\n' 'M5_ISOLATION_PROBE=FAIL' >>"$m5_result"
+            fi
+            if [ "$sdk_probe_status" -ne 0 ] || [ "$m5_probe_status" -ne 0 ]; then
+              printf '%s\n' 'HYBRID_ISOLATION_PROBE=FAIL'
+              exit 1
+            fi
             printf '%s\n' 'HYBRID_ISOLATION_PROBE=PASS'
           ) >"$out/measurement.txt" 2>&1
           probe_status=$?
@@ -828,7 +1128,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: taoistfuchen-ubuntu-24.04-isolation-v2
-          path: runner-isolation-v2/
+          name: taoistfuchen-ubuntu-24.04-isolation-v3
+          path: runner-isolation-v3/
           if-no-files-found: error
           retention-days: 7
