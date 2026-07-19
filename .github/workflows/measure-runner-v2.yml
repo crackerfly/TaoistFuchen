@@ -1,0 +1,834 @@
+name: Probe TaoistFuchen hybrid isolation on ubuntu-24.04
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe sudo-unshare and pinned Bubblewrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Measure and probe the exact isolation candidates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          out=runner-isolation-v2
+          mkdir -m 0700 -- "$out"
+
+          set +e
+          (
+            set -Eeuo pipefail
+            umask 077
+
+            uid=$(/usr/bin/id -u)
+            gid=$(/usr/bin/id -g)
+            host_pid=$$
+            host_net=$(/usr/bin/readlink /proc/self/ns/net)
+            host_mnt=$(/usr/bin/readlink /proc/self/ns/mnt)
+            host_pidns=$(/usr/bin/readlink /proc/self/ns/pid)
+            host_uts=$(/usr/bin/readlink /proc/self/ns/uts)
+            host_ipc=$(/usr/bin/readlink /proc/self/ns/ipc)
+            repo_root=$(/usr/bin/readlink -f -- "$GITHUB_WORKSPACE")
+            temp_root=$(/usr/bin/readlink -f -- "$RUNNER_TEMP")
+            host_user=$(/usr/bin/readlink /proc/self/ns/user)
+            work_root="$temp_root/taoistfuchen-isolation-v2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            sdk_fixture="$work_root/sdk-fixture"
+            sdk_sibling="$work_root/sdk-writable-sibling"
+            m5_root="$work_root/m5-disposable"
+            download_root="$work_root/downloads"
+            extract_root="$work_root/extracted"
+            listener_pid=
+            active_m5_case=
+            active_m5_case_devino=
+            active_m5_parent_devino=
+            bwrap=
+            busybox=
+
+            cleanup_m5_case() {
+              candidate=${1-}
+              [ -n "$candidate" ] || return 0
+              [ -n "$busybox" ] && [ -x "$busybox" ] || {
+                printf 'CLEANUP_ERROR=no pinned BusyBox for %s\n' "$candidate"
+                return 1
+              }
+              /usr/bin/printf '%s  %s\n' \
+                dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14 \
+                "$busybox" | /usr/bin/sha256sum -c - >/dev/null || {
+                  printf '%s\n' 'CLEANUP_ERROR=BusyBox hash drift'
+                  return 1
+                }
+              cleanup_build_id=$(
+                /usr/bin/readelf -n -- "$busybox" |
+                  /usr/bin/sed -n 's/.*Build ID: //p' |
+                  /usr/bin/head -n 1
+              ) || return 1
+              [ "$cleanup_build_id" = 351ba74c282274bdd56e030c641d226cab5c14b7 ] || {
+                printf '%s\n' 'CLEANUP_ERROR=BusyBox build-id drift'
+                return 1
+              }
+              if /usr/bin/readelf -l -- "$busybox" 2>/dev/null |
+                /usr/bin/grep -F 'Requesting program interpreter' >/dev/null
+              then
+                printf '%s\n' 'CLEANUP_ERROR=BusyBox is not static'
+                return 1
+              fi
+              "$busybox" --list | /usr/bin/grep -Fx rm >/dev/null || {
+                printf '%s\n' 'CLEANUP_ERROR=BusyBox rm applet missing'
+                return 1
+              }
+              [ -e "$candidate" ] || return 0
+              [ ! -L "$candidate" ] || {
+                printf 'CLEANUP_ERROR=refusing symlink %s\n' "$candidate"
+                return 1
+              }
+              parent_real=$(/usr/bin/readlink -f -- "$m5_root") || return 1
+              candidate_real=$(/usr/bin/readlink -f -- "$candidate") || return 1
+              [ "$(/usr/bin/stat -Lc '%d:%i' -- "$m5_root")" = "$active_m5_parent_devino" ] || {
+                printf '%s\n' 'CLEANUP_ERROR=disposable parent identity changed'
+                return 1
+              }
+              [ "$(/usr/bin/stat -Lc '%d:%i' -- "$candidate")" = "$active_m5_case_devino" ] || {
+                printf '%s\n' 'CLEANUP_ERROR=fixture identity changed'
+                return 1
+              }
+              [ "$candidate_real" != "$parent_real" ] || {
+                printf 'CLEANUP_ERROR=refusing disposable root itself\n'
+                return 1
+              }
+              case "$candidate_real" in
+                "$parent_real"/*) ;;
+                *)
+                  printf 'CLEANUP_ERROR=outside disposable root: %s\n' "$candidate_real"
+                  return 1
+                  ;;
+              esac
+              /usr/bin/sudo -n -- "$busybox" rm -rf -- "$candidate_real" || return 1
+              [ ! -e "$candidate_real" ] || {
+                printf 'CLEANUP_ERROR=path survived cleanup: %s\n' "$candidate_real"
+                return 1
+              }
+              printf 'CLEANUP_OK=%s\n' "$candidate_real"
+            }
+
+            on_exit() {
+              rc=$?
+              trap - EXIT INT TERM HUP
+              set +e
+              cleanup_rc=0
+              if [ -n "$listener_pid" ]; then
+                /bin/kill "$listener_pid" 2>/dev/null
+                wait "$listener_pid" 2>/dev/null
+              fi
+              if [ -n "$active_m5_case" ]; then
+                if cleanup_m5_case "$active_m5_case"; then
+                  active_m5_case=
+                else
+                  cleanup_rc=$?
+                fi
+              fi
+              if [ -d "$work_root" ]; then
+                if [ -z "$active_m5_case" ]; then
+                  /bin/rm -rf -- "$work_root" || cleanup_rc=1
+                  [ ! -e "$work_root" ] || cleanup_rc=1
+                fi
+              fi
+              if [ "$rc" -eq 0 ] && [ "$cleanup_rc" -ne 0 ]; then
+                rc=$cleanup_rc
+              fi
+              exit "$rc"
+            }
+            trap on_exit EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM HUP
+
+            record_elf_closure() {
+              label=$1
+              shift
+              destination="$PWD/$out/elf-closure-$label.txt"
+              : >"$destination"
+              declare -a queue=()
+              declare -A seen=()
+              local requested resolved path
+              for requested in "$@"; do
+                [ -e "$requested" ] || {
+                  printf 'MISSING=%s\n' "$requested" >>"$destination"
+                  return 1
+                }
+                queue+=("$(/usr/bin/readlink -f -- "$requested")")
+              done
+              while ((${#queue[@]})); do
+                path=${queue[0]}
+                queue=("${queue[@]:1}")
+                resolved=$(/usr/bin/readlink -f -- "$path")
+                [ -f "$resolved" ] || continue
+                if [[ -n ${seen["$resolved"]+yes} ]]; then
+                  continue
+                fi
+                seen["$resolved"]=1
+                owner_line=$(
+                  /usr/bin/dpkg-query -S "$resolved" 2>/dev/null |
+                    /usr/bin/head -n 1
+                ) || owner_line=
+                {
+                  printf '%s\n' "--- PATH=$path RESOLVED=$resolved"
+                  /usr/bin/stat -Lc 'MODE=%a UID=%u GID=%g SIZE=%s DEV=%d INO=%i' -- "$resolved"
+                  /usr/bin/sha256sum -- "$resolved"
+                  /usr/bin/file -- "$resolved"
+                  /usr/bin/dpkg-query -S "$resolved" 2>&1 || true
+                  if [ -n "$owner_line" ]; then
+                    owner_package=${owner_line%%:*}
+                    /usr/bin/dpkg-query -W \
+                      -f='OWNER_PACKAGE=${binary:Package} OWNER_VERSION=${Version} OWNER_ARCH=${Architecture}\n' \
+                      "$owner_package"
+                  else
+                    printf '%s\n' 'OWNER_PACKAGE=UNPACKED_INPUT'
+                  fi
+                  /usr/bin/readelf -n -- "$resolved" 2>&1 || true
+                  /usr/bin/readelf -l -- "$resolved" 2>&1 || true
+                  /usr/bin/readelf -d -- "$resolved" 2>&1 || true
+                  /usr/bin/ldd -- "$resolved" 2>&1 || true
+                } >>"$destination"
+                mapfile -t discovered < <(
+                  {
+                    /usr/bin/readelf -l -- "$resolved" 2>/dev/null |
+                      /usr/bin/sed -n 's@.*interpreter: \([^]]*\).*@\1@p'
+                    /usr/bin/ldd -- "$resolved" 2>/dev/null |
+                      /usr/bin/awk '
+                        /=>[[:space:]]+\// {
+                          for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i
+                        }
+                        /^[[:space:]]*\// { print $1 }
+                      '
+                  } | LC_ALL=C /usr/bin/sort -u
+                )
+                if ((${#discovered[@]})); then
+                  queue+=("${discovered[@]}")
+                fi
+              done
+            }
+
+            assert_runner_owned_tree() {
+              root=$1
+              while IFS= read -r -d '' path; do
+                owner=$(/usr/bin/stat -Lc '%u:%g' -- "$path")
+                printf 'SDK_OWNER=%s %s\n' "$owner" "$path"
+                [ "$owner" = "$uid:$gid" ]
+              done < <(/usr/bin/find "$root" -mindepth 0 -print0)
+            }
+
+            wait_for_no_bwrap() {
+              attempt=0
+              while /usr/bin/pgrep -f -- "$bwrap" >/dev/null 2>&1; do
+                attempt=$((attempt + 1))
+                [ "$attempt" -lt 50 ] || {
+                  printf 'BWRAP_HELPER_SURVIVED=%s\n' "$bwrap"
+                  return 1
+                }
+                /bin/sleep 0.1
+              done
+            }
+
+            make_m5_case() {
+              name=$1
+              candidate="$m5_root/$name"
+              /usr/bin/mkdir -m 0700 -- "$candidate"
+              /usr/bin/mkdir -m 0700 -- "$candidate/selected" "$candidate/sibling"
+              /usr/bin/mkdir -m 0700 -- "$candidate/selected/mnt"
+              /usr/bin/printf 'input\n' >"$candidate/selected/input"
+              active_m5_parent_devino=$(/usr/bin/stat -Lc '%d:%i' -- "$m5_root")
+              active_m5_case_devino=$(/usr/bin/stat -Lc '%d:%i' -- "$candidate")
+              active_m5_case=$candidate
+            }
+
+            finish_m5_case() {
+              selected=$1
+              proof=$2
+              [ -f "$selected/$proof" ]
+              owner=$(/usr/bin/stat -Lc '%u:%g' -- "$selected/$proof")
+              printf 'M5_OUTER_OWNER=%s PATH=%s\n' "$owner" "$selected/$proof"
+              [ "$owner" = '0:0' ]
+              case_path=$active_m5_case
+              cleanup_m5_case "$case_path"
+              active_m5_case=
+              active_m5_case_devino=
+              active_m5_parent_devino=
+              [ ! -e "$case_path" ]
+              ! /usr/bin/grep -F -- "$case_path" /proc/self/mountinfo >/dev/null
+              wait_for_no_bwrap
+            }
+
+            run_m5_bwrap() {
+              capability_mode=$1
+              selected=$2
+              shift 2
+              declare -a capability_args=(--cap-drop ALL)
+              case "$capability_mode" in
+                zero) ;;
+                mount) capability_args+=(--cap-add CAP_SYS_ADMIN) ;;
+                *) return 2 ;;
+              esac
+              /usr/bin/sudo -n -- "$bwrap" \
+                --die-with-parent --new-session \
+                --unshare-user --disable-userns \
+                --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+                --uid 0 --gid 0 "${capability_args[@]}" \
+                --clearenv \
+                --setenv PATH /bin --setenv HOME / --setenv TMPDIR /tmp \
+                --setenv LC_ALL C --setenv TZ UTC \
+                --perms 0755 --size 33554432 --tmpfs / \
+                --dir /bin --perms 0555 --file 0 /bin/busybox \
+                --symlink busybox /bin/sh \
+                --proc /proc --dev /dev \
+                --perms 0700 --size 16777216 --tmpfs /tmp \
+                --dir /fixture --bind "$selected" /fixture \
+                --chdir / -- \
+                "$@" <"$busybox"
+            }
+
+            printf '%s\n' '=== RUNNER / KERNEL / POLICY ==='
+            printf 'ImageOS=%s\nImageVersion=%s\nRUNNER_OS=%s\nRUNNER_ARCH=%s\n' \
+              "${ImageOS-}" "${ImageVersion-}" "${RUNNER_OS-}" "${RUNNER_ARCH-}"
+            printf 'UID=%s\nGID=%s\nGROUPS=%s\nHOST_PID=%s\nHOST_NET=%s\nHOST_MNT=%s\nHOST_USER=%s\nHOST_PIDNS=%s\nHOST_UTS=%s\nHOST_IPC=%s\n' \
+              "$uid" "$gid" "$(/usr/bin/id -G)" "$host_pid" "$host_net" "$host_mnt" "$host_user" \
+              "$host_pidns" "$host_uts" "$host_ipc"
+            /usr/bin/uname -a
+            /usr/bin/cat /etc/os-release
+            /usr/bin/cat /proc/self/attr/current 2>/dev/null || true
+            for policy_path in \
+              /sys/module/apparmor/parameters/enabled \
+              /proc/sys/kernel/unprivileged_userns_clone \
+              /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            do
+              if [ -r "$policy_path" ]; then
+                printf '%s=' "$policy_path"
+                /usr/bin/cat "$policy_path"
+              fi
+            done
+            /usr/bin/findmnt -no TARGET,PROPAGATION / 2>&1 || true
+
+            printf '%s\n' '=== PACKAGE IDENTITIES ==='
+            /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' \
+              sudo util-linux coreutils dash libc6 libcap-ng0 libselinux1 \
+              libcap2 libpcre2-8-0 2>&1
+
+            printf '%s\n' '=== SUDO AUTHORITY / POLICY ==='
+            /usr/bin/sudo -V >"$PWD/$out/sudo-version.txt" 2>&1
+            /usr/bin/sudo -n -l >"$PWD/$out/sudo-list.txt" 2>&1
+            /usr/bin/sudo -n -- /usr/bin/true
+            /usr/bin/sudo -n -- /usr/bin/id -u >"$PWD/$out/sudo-root-id.txt"
+            [ "$(/usr/bin/cat "$PWD/$out/sudo-root-id.txt")" = 0 ]
+            : >"$PWD/$out/sudo-config.txt"
+            while IFS= read -r config_path; do
+              [ -n "$config_path" ] || continue
+              /usr/bin/sudo -n -- /usr/bin/stat -Lc \
+                '%n MODE=%a UID=%u GID=%g SIZE=%s' -- "$config_path" \
+                >>"$PWD/$out/sudo-config.txt"
+              /usr/bin/sudo -n -- /usr/bin/sha256sum -- "$config_path" \
+                >>"$PWD/$out/sudo-config.txt"
+            done < <(
+              {
+                [ ! -f /etc/sudo.conf ] || /usr/bin/printf '%s\n' /etc/sudo.conf
+                [ ! -f /etc/sudoers ] || /usr/bin/printf '%s\n' /etc/sudoers
+                if [ -d /etc/sudoers.d ]; then
+                  /usr/bin/find /etc/sudoers.d -type f -print
+                fi
+              } | LC_ALL=C /usr/bin/sort -u
+            )
+            set +e
+            LD_LIBRARY_PATH=/taoistfuchen-denied \
+            LD_PRELOAD=/taoistfuchen-denied.so \
+              /usr/bin/sudo -n -- /usr/bin/env \
+                2>"$PWD/$out/sudo-loader-env.stderr.txt" |
+              /usr/bin/grep -E '^LD_(AUDIT|LIBRARY_PATH|PRELOAD)=' >/dev/null
+            pipeline_status=("${PIPESTATUS[@]}")
+            sudo_env_status=${pipeline_status[0]}
+            loader_env_match_status=${pipeline_status[1]}
+            set -e
+            [ "$sudo_env_status" -eq 0 ]
+            [ "$loader_env_match_status" -eq 1 ]
+            printf '%s\n' 'SUDO_LOADER_ENVIRONMENT=STRIPPED_WITHOUT_ENV_DUMP' \
+              >"$PWD/$out/sudo-loader-env-result.txt"
+
+            mapfile -t sudo_elfs < <(
+              /usr/bin/dpkg-query -L sudo |
+                while IFS= read -r path; do
+                  [ -f "$path" ] || continue
+                  /usr/bin/readelf -h -- "$path" >/dev/null 2>&1 || continue
+                  /usr/bin/readlink -f -- "$path"
+                done | LC_ALL=C /usr/bin/sort -u
+            )
+            record_elf_closure host \
+              /usr/bin/sudo /usr/bin/unshare /usr/bin/setpriv /usr/bin/id \
+              /usr/bin/nsenter /usr/bin/readlink /usr/bin/sha256sum \
+              /usr/bin/stat /usr/bin/env /usr/bin/true /usr/bin/timeout \
+              /usr/bin/findmnt /usr/bin/grep /usr/bin/pgrep \
+              /bin/sh "${sudo_elfs[@]}"
+
+            /usr/bin/mkdir -m 0700 -- "$work_root" "$download_root" "$extract_root"
+
+            printf '%s\n' '=== PINNED PACKAGE INPUTS ==='
+            bwrap_deb="$download_root/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
+            busybox_deb="$download_root/busybox-static_1.36.1-6ubuntu3.1_amd64.deb"
+            /usr/bin/curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+              'https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb' \
+              --output "$bwrap_deb"
+            /usr/bin/printf '%s  %s\n' \
+              1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a \
+              "$bwrap_deb" | /usr/bin/sha256sum -c -
+            [ "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Package)" = bubblewrap ]
+            [ "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Version)" = 0.9.0-1ubuntu0.1 ]
+            [ "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Architecture)" = amd64 ]
+            {
+              /usr/bin/printf 'Package=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Package)"
+              /usr/bin/printf 'Version=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Version)"
+              /usr/bin/printf 'Architecture=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Architecture)"
+              /usr/bin/printf 'Depends=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Depends)"
+            } >"$PWD/$out/bubblewrap-control.txt"
+            /usr/bin/dpkg-deb -x "$bwrap_deb" "$extract_root/bubblewrap"
+            bwrap="$extract_root/bubblewrap/usr/bin/bwrap"
+            [ -x "$bwrap" ]
+            /usr/bin/printf '%s  %s\n' \
+              52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712 \
+              "$bwrap" | /usr/bin/sha256sum -c -
+            bwrap_build_id=$(
+              /usr/bin/readelf -n -- "$bwrap" |
+                /usr/bin/sed -n 's/.*Build ID: //p' |
+                /usr/bin/head -n 1
+            )
+            [ "$bwrap_build_id" = e1a0ef69f8106c7ee586e06a65f23e1b166bdcbe ]
+            /usr/bin/sudo -n -- "$bwrap" --version >"$PWD/$out/bubblewrap-version.txt"
+            /usr/bin/grep -Fx 'bubblewrap 0.9.0' "$PWD/$out/bubblewrap-version.txt"
+
+            /usr/bin/curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+              'https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_amd64.deb' \
+              --output "$busybox_deb"
+            /usr/bin/printf '%s  %s\n' \
+              944b2728f53ceb3916cec2c962873c9951e612408099601751db2a0a5d81e0ed \
+              "$busybox_deb" | /usr/bin/sha256sum -c -
+            [ "$(/usr/bin/dpkg-deb -f "$busybox_deb" Package)" = busybox-static ]
+            [ "$(/usr/bin/dpkg-deb -f "$busybox_deb" Version)" = 1:1.36.1-6ubuntu3.1 ]
+            [ "$(/usr/bin/dpkg-deb -f "$busybox_deb" Architecture)" = amd64 ]
+            /usr/bin/dpkg-deb -x "$busybox_deb" "$extract_root/busybox"
+            mapfile -t busybox_candidates < <(
+              /usr/bin/find "$extract_root/busybox" -type f -name busybox -print
+            )
+            [ "${#busybox_candidates[@]}" -eq 1 ]
+            busybox=${busybox_candidates[0]}
+            [ -x "$busybox" ]
+            /usr/bin/printf '%s  %s\n' \
+              dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14 \
+              "$busybox" | /usr/bin/sha256sum -c -
+            busybox_build_id=$(
+              /usr/bin/readelf -n -- "$busybox" |
+                /usr/bin/sed -n 's/.*Build ID: //p' |
+                /usr/bin/head -n 1
+            )
+            [ "$busybox_build_id" = 351ba74c282274bdd56e030c641d226cab5c14b7 ]
+            ! /usr/bin/readelf -l -- "$busybox" 2>/dev/null |
+              /usr/bin/grep -F 'Requesting program interpreter' >/dev/null
+            for required_applet in \
+              ash awk cat dd mkdir mount nc readlink rm sh sha256sum sleep stat true umount unshare
+            do
+              "$busybox" --list | /usr/bin/grep -Fx "$required_applet" >/dev/null
+            done
+            {
+              /usr/bin/printf 'Package=%s\n' "$(/usr/bin/dpkg-deb -f "$busybox_deb" Package)"
+              /usr/bin/printf 'Version=%s\n' "$(/usr/bin/dpkg-deb -f "$busybox_deb" Version)"
+              /usr/bin/printf 'Architecture=%s\n' "$(/usr/bin/dpkg-deb -f "$busybox_deb" Architecture)"
+              /usr/bin/printf 'ExtractedPath=%s\n' "${busybox#"$extract_root/busybox"/}"
+            } >"$PWD/$out/busybox-control.txt"
+            record_elf_closure pinned "$bwrap" "$busybox"
+
+            printf '%s\n' '=== CONTROLLED EXTRACTED-TOOL DRIFT ==='
+            /usr/bin/mkdir -m 0700 -- "$work_root/drift"
+            /bin/cp -- "$bwrap" "$work_root/drift/bwrap"
+            /bin/cp -- "$busybox" "$work_root/drift/busybox"
+            /usr/bin/printf 'drift\n' >>"$work_root/drift/bwrap"
+            /usr/bin/printf 'drift\n' >>"$work_root/drift/busybox"
+            if /usr/bin/printf '%s  %s\n' \
+              52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712 \
+              "$work_root/drift/bwrap" | /usr/bin/sha256sum -c - >/dev/null 2>&1
+            then
+              exit 81
+            fi
+            if /usr/bin/printf '%s  %s\n' \
+              dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14 \
+              "$work_root/drift/busybox" | /usr/bin/sha256sum -c - >/dev/null 2>&1
+            then
+              exit 82
+            fi
+            printf '%s\n' 'EXTRACTED_TOOL_DRIFT=REJECTED_BEFORE_PRIVILEGED_ENTRY'
+
+            printf '%s\n' '=== PARENT LISTENER ==='
+            listener_port_file="$PWD/$out/listener-port.txt"
+            parent_socket="$work_root/parent.sock"
+            /usr/bin/python3 -c '
+          import pathlib
+          import select
+          import socket
+          import sys
+
+          listener = socket.socket()
+          listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          listener.bind(("127.0.0.1", 0))
+          listener.listen()
+          unix_listener = socket.socket(socket.AF_UNIX)
+          unix_listener.bind(sys.argv[2])
+          unix_listener.listen()
+          pathlib.Path(sys.argv[1]).write_text(str(listener.getsockname()[1]), encoding="ascii")
+          while True:
+              readable, _, _ = select.select([listener, unix_listener], [], [])
+              for current in readable:
+                  connection, _ = current.accept()
+                  connection.close()
+          ' "$listener_port_file" "$parent_socket" &
+            listener_pid=$!
+            for unused in {1..100}; do
+              [ -s "$listener_port_file" ] && break
+              /bin/sleep 0.05
+            done
+            [ -s "$listener_port_file" ]
+            [ -S "$parent_socket" ]
+            listener_port=$(/usr/bin/cat "$listener_port_file")
+            [[ "$listener_port" =~ ^[0-9]+$ ]]
+            /usr/bin/python3 -c \
+              'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' \
+              "$listener_port"
+
+            printf '%s\n' '=== SDK SUDO-UNSHARE/SETPRIV PROBE ==='
+            [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ne 0 ]
+            [[ "$gid" =~ ^[0-9]+$ ]] && [ "$gid" -ne 0 ]
+            /usr/bin/mkdir -m 0700 -- "$sdk_fixture" "$sdk_sibling"
+            /usr/bin/printf 'runner-owned input\n' >"$sdk_fixture/input"
+            exec 63<>"/dev/tcp/127.0.0.1/$listener_port"
+            /usr/bin/sudo -n -- /usr/bin/unshare \
+              --mount --net --mount-proc=/proc --propagation private \
+              --setgid "$gid" --setuid "$uid" -- \
+              /usr/bin/setpriv \
+                --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
+              /bin/sh -eu -c '
+                expected_uid=$1
+                expected_gid=$2
+                expected_net=$3
+                expected_mnt=$4
+                expected_user=$5
+                fixture=$6
+                sibling=$7
+                listener_port=$8
+                parent_pid=$9
+                inherited_fd=${10}
+
+                uid_ok=0
+                gid_ok=0
+                groups_ok=0
+                cap_inh_ok=0
+                cap_prm_ok=0
+                cap_eff_ok=0
+                cap_amb_ok=0
+                nnp_ok=0
+                while read -r key a b c d rest; do
+                  case "$key" in
+                    Uid:)
+                      [ "$a" = "$expected_uid" ] && [ "$b" = "$expected_uid" ] &&
+                        [ "$c" = "$expected_uid" ] && [ "$d" = "$expected_uid" ] && uid_ok=1
+                      ;;
+                    Gid:)
+                      [ "$a" = "$expected_gid" ] && [ "$b" = "$expected_gid" ] &&
+                        [ "$c" = "$expected_gid" ] && [ "$d" = "$expected_gid" ] && gid_ok=1
+                      ;;
+                    Groups:) [ -z "${a-}" ] && groups_ok=1 ;;
+                    CapInh:) [ "$a" = 0000000000000000 ] && cap_inh_ok=1 ;;
+                    CapPrm:) [ "$a" = 0000000000000000 ] && cap_prm_ok=1 ;;
+                    CapEff:) [ "$a" = 0000000000000000 ] && cap_eff_ok=1 ;;
+                    CapAmb:) [ "$a" = 0000000000000000 ] && cap_amb_ok=1 ;;
+                    NoNewPrivs:) [ "$a" = 1 ] && nnp_ok=1 ;;
+                  esac
+                done </proc/self/status
+                [ "$uid_ok$gid_ok$groups_ok$cap_inh_ok$cap_prm_ok$cap_eff_ok$cap_amb_ok$nnp_ok" = 11111111 ]
+                [ "$(/usr/bin/id -u)" = "$expected_uid" ]
+                [ "$(/usr/bin/id -g)" = "$expected_gid" ]
+                [ "$(/usr/bin/id -G)" = "$expected_gid" ]
+                [ "$(/usr/bin/readlink /proc/self/ns/net)" != "$expected_net" ]
+                [ "$(/usr/bin/readlink /proc/self/ns/mnt)" != "$expected_mnt" ]
+                [ "$(/usr/bin/readlink /proc/self/ns/user)" = "$expected_user" ]
+                [ ! -e "/proc/self/fd/$inherited_fd" ]
+                /usr/bin/findmnt -no FSTYPE,OPTIONS /proc |
+                  /usr/bin/grep -E "^proc .*(nosuid.*nodev.*noexec|nosuid.*noexec.*nodev|nodev.*nosuid.*noexec|nodev.*noexec.*nosuid|noexec.*nosuid.*nodev|noexec.*nodev.*nosuid)" \
+                  >/dev/null
+                nonloopback_route_count=0
+                while read -r iface destination rest; do
+                  [ "$iface" = Iface ] || [ "$iface" = lo ] ||
+                    nonloopback_route_count=$((nonloopback_route_count + 1))
+                done </proc/net/route
+                [ "$nonloopback_route_count" -eq 0 ]
+                nonloopback_ipv6_route_count=0
+                while read -r destination prefix source source_prefix next_hop metric ref use flags iface; do
+                  [ -z "${iface-}" ] || [ "$iface" = lo ] ||
+                    nonloopback_ipv6_route_count=$((nonloopback_ipv6_route_count + 1))
+                done </proc/net/ipv6_route
+                [ "$nonloopback_ipv6_route_count" -eq 0 ]
+
+                /usr/bin/mkdir -p -- "$fixture/nested/deeper"
+                /usr/bin/printf 'offline write\n' >"$fixture/nested/deeper/output"
+                /usr/bin/sha256sum "$fixture/input" >"$fixture/input.sha256"
+                /usr/bin/printf 'expected runner-writable sibling\n' >"$sibling/proof"
+                /usr/bin/cat /proc/net/route >"$fixture/ipv4-route.txt"
+                /usr/bin/cat /proc/net/ipv6_route >"$fixture/ipv6-route.txt"
+                /usr/bin/python3 -c \
+                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) != 0 else 1)'"'"' \
+                  127.0.0.1 "$listener_port"
+                /usr/bin/python3 -c \
+                  '"'"'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) != 0 else 1)'"'"' \
+                  1.1.1.1 443
+                if /usr/bin/sudo -n -- /usr/bin/id -u >"$fixture/sudo-regain.txt" 2>&1; then
+                  exit 91
+                fi
+                if /usr/bin/nsenter --net="/proc/$parent_pid/ns/net" /bin/true \
+                  >"$fixture/nsenter-regain.txt" 2>&1; then
+                  exit 92
+                fi
+                /usr/bin/printf 'CapBnd=' >>"$fixture/state.txt"
+                while read -r key value rest; do
+                  [ "$key" != CapBnd: ] || /usr/bin/printf '%s\n' "$value" >>"$fixture/state.txt"
+                done </proc/self/status
+              ' probe "$uid" "$gid" "$host_net" "$host_mnt" "$host_user" \
+                "$sdk_fixture" "$sdk_sibling" "$listener_port" "$host_pid" 63
+            exec 63>&-
+
+            assert_runner_owned_tree "$sdk_fixture"
+            assert_runner_owned_tree "$sdk_sibling"
+            printf '%s\n' 'SDK_WRITABLE_SIBLING=EXPECTED_AND_CONFIRMED'
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/unshare \
+              --mount --net --mount-proc=/proc --propagation private \
+              --setgid "$gid" --setuid "$uid" -- \
+              /usr/bin/setpriv \
+                --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
+              /bin/sh -c 'exit 37'
+            sdk_exit_status=$?
+            /usr/bin/sudo -n -- /usr/bin/unshare \
+              --mount --net --mount-proc=/proc --propagation private \
+              --setgid "$gid" --setuid "$uid" -- \
+              /usr/bin/setpriv \
+                --no-new-privs --inh-caps=-all --ambient-caps=-all -- \
+              /bin/sh -c 'kill -TERM $$'
+            sdk_signal_status=$?
+            set -e
+            printf 'SDK_EXIT_STATUS=%s\n' "$sdk_exit_status"
+            printf 'SDK_SIGNAL_STATUS=%s\n' "$sdk_signal_status"
+            [ "$sdk_exit_status" -eq 37 ]
+            [ "$sdk_signal_status" -eq 143 ]
+            ! /usr/bin/grep -F -- "$sdk_fixture" /proc/self/mountinfo >/dev/null
+            ! /usr/bin/grep -F -- "$sdk_sibling" /proc/self/mountinfo >/dev/null
+            /usr/bin/python3 -c \
+              'import socket,sys; s=socket.socket(); s.settimeout(2); raise SystemExit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' \
+              "$listener_port"
+
+            printf '%s\n' '=== M5 EMPTY-ROOT BWRAP PROBES ==='
+            /usr/bin/mkdir -m 0700 -- "$m5_root"
+            m5_probe_script=
+            read -r -d '' m5_probe_script <<'M5_PROBE' || true
+          set -eu
+          bb=/bin/busybox
+          mode=$1
+          listener_port=$2
+          parent_socket=$3
+          repo=$4
+          sibling=$5
+          expected_user=$6
+          expected_mnt=$7
+          expected_pid=$8
+          expected_net=$9
+          expected_uts=${10}
+          expected_ipc=${11}
+          
+          [ "$($bb id -u)" = 0 ]
+          [ "$($bb id -g)" = 0 ]
+          [ "$($bb readlink /proc/self/ns/user)" != "$expected_user" ]
+          [ "$($bb readlink /proc/self/ns/mnt)" != "$expected_mnt" ]
+          [ "$($bb readlink /proc/self/ns/pid)" != "$expected_pid" ]
+          [ "$($bb readlink /proc/self/ns/net)" != "$expected_net" ]
+          [ "$($bb readlink /proc/self/ns/uts)" != "$expected_uts" ]
+          [ "$($bb readlink /proc/self/ns/ipc)" != "$expected_ipc" ]
+          set -- $($bb cat /proc/self/uid_map)
+          [ "$1" = 0 ] && [ "$2" = 0 ] && [ "$3" = 1 ]
+          
+          cap_inh=bad
+          cap_prm=bad
+          cap_eff=bad
+          cap_bnd=bad
+          cap_amb=bad
+          nnp=bad
+          while read -r key value rest; do
+            case "$key" in
+              CapInh:) cap_inh=$value ;;
+              CapPrm:) cap_prm=$value ;;
+              CapEff:) cap_eff=$value ;;
+              CapBnd:) cap_bnd=$value ;;
+              CapAmb:) cap_amb=$value ;;
+              NoNewPrivs:) nnp=$value ;;
+            esac
+          done </proc/self/status
+          [ "$nnp" = 1 ]
+          case "$mode" in
+            zero)
+              [ "$cap_inh$cap_prm$cap_eff$cap_bnd$cap_amb" = \
+                00000000000000000000000000000000000000000000000000000000000000000000000000000000 ]
+              if $bb mount -t tmpfs -o nosuid,nodev,noexec,size=1m tmpfs /fixture/mnt; then
+                $bb umount /fixture/mnt || true
+                exit 111
+              fi
+              ;;
+            mount)
+              [ "$cap_inh" = 0000000000000000 ]
+              [ "$cap_prm" = 0000000000200000 ]
+              [ "$cap_eff" = 0000000000200000 ]
+              [ "$cap_bnd" = 0000000000200000 ]
+              [ "$cap_amb" = 0000000000000000 ]
+              $bb mount -t tmpfs -o nosuid,nodev,noexec,size=1m tmpfs /fixture/mnt
+              $bb grep -F ' /fixture/mnt ' /proc/self/mountinfo >/dev/null
+              $bb printf 'private mount\n' >/fixture/mnt/private
+              $bb umount /fixture/mnt
+              ! $bb grep -F ' /fixture/mnt ' /proc/self/mountinfo >/dev/null
+              ;;
+            *) exit 112 ;;
+          esac
+          
+          if $bb unshare -U /bin/busybox true >/tmp/unshare.out 2>&1; then
+            exit 113
+          fi
+          [ ! -e /home ]
+          [ ! -e /root ]
+          [ ! -e /run ]
+          [ ! -e "$repo" ]
+          [ ! -e "$sibling" ]
+          [ ! -e "$parent_socket" ]
+          [ ! -e /dev/sda ]
+          [ ! -e /dev/nvme0n1 ]
+          $bb dd if=/dev/urandom of=/tmp/random bs=32 count=1 2>/dev/null
+          [ "$($bb stat -c %s /tmp/random)" = 32 ]
+          $bb printf 'private tmpfs\n' >/tmp/private-proof
+          route_count=0
+          while read -r iface destination rest; do
+            [ "$iface" = Iface ] || route_count=$((route_count + 1))
+          done </proc/net/route
+          [ "$route_count" -eq 0 ]
+          if $bb nc -w 1 127.0.0.1 "$listener_port" </dev/null >/dev/null 2>&1; then
+            exit 114
+          fi
+          if $bb nc -w 1 1.1.1.1 443 </dev/null >/dev/null 2>&1; then
+            exit 115
+          fi
+          ! $bb grep -F "$repo" /proc/self/mountinfo >/dev/null
+          ! $bb grep -F "$sibling" /proc/self/mountinfo >/dev/null
+          $bb cat /proc/self/status >"/fixture/status-$mode.txt"
+          $bb cat /proc/self/mountinfo >"/fixture/mountinfo-$mode.txt"
+          $bb printf 'root-owned disposable proof\n' >"/fixture/$mode-proof"
+          M5_PROBE
+
+            printf '%s\n' '=== M5 ZERO-CAPABILITY LANE ==='
+            make_m5_case zero
+            zero_case=$active_m5_case
+            zero_selected="$zero_case/selected"
+            zero_sibling="$zero_case/sibling"
+            run_m5_bwrap zero "$zero_selected" \
+              /bin/busybox sh -eu -c "$m5_probe_script" probe \
+              zero "$listener_port" "$parent_socket" "$repo_root" "$zero_sibling" \
+              "$host_user" "$host_mnt" "$host_pidns" "$host_net" "$host_uts" "$host_ipc"
+            finish_m5_case "$zero_selected" zero-proof
+
+            printf '%s\n' '=== M5 MOUNT-CAPABILITY LANE ==='
+            make_m5_case mount
+            mount_case=$active_m5_case
+            mount_selected="$mount_case/selected"
+            mount_sibling="$mount_case/sibling"
+            run_m5_bwrap mount "$mount_selected" \
+              /bin/busybox sh -eu -c "$m5_probe_script" probe \
+              mount "$listener_port" "$parent_socket" "$repo_root" "$mount_sibling" \
+              "$host_user" "$host_mnt" "$host_pidns" "$host_net" "$host_uts" "$host_ipc"
+            [ ! -e "$mount_selected/mnt/private" ]
+            finish_m5_case "$mount_selected" mount-proof
+
+            printf '%s\n' '=== M5 CHILD-FAILURE CLEANUP ==='
+            make_m5_case failure
+            failure_case=$active_m5_case
+            failure_selected="$failure_case/selected"
+            set +e
+            run_m5_bwrap zero "$failure_selected" \
+              /bin/busybox sh -eu -c \
+                '/bin/busybox printf failure >/fixture/failure-proof; exit 23'
+            failure_status=$?
+            set -e
+            printf 'M5_FAILURE_STATUS=%s\n' "$failure_status"
+            [ "$failure_status" -eq 23 ]
+            finish_m5_case "$failure_selected" failure-proof
+
+            printf '%s\n' '=== M5 TIMEOUT CLEANUP ==='
+            make_m5_case timeout
+            timeout_case=$active_m5_case
+            timeout_selected="$timeout_case/selected"
+            set +e
+            /usr/bin/timeout --signal=TERM --kill-after=2s 5s \
+              /usr/bin/sudo -n -- "$bwrap" \
+                --die-with-parent --new-session \
+                --unshare-user --disable-userns \
+                --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+                --uid 0 --gid 0 --cap-drop ALL \
+                --clearenv \
+                --setenv PATH /bin --setenv HOME / --setenv TMPDIR /tmp \
+                --setenv LC_ALL C --setenv TZ UTC \
+                --perms 0755 --size 33554432 --tmpfs / \
+                --dir /bin --perms 0555 --file 0 /bin/busybox \
+                --symlink busybox /bin/sh \
+                --proc /proc --dev /dev \
+                --perms 0700 --size 16777216 --tmpfs /tmp \
+                --dir /fixture --bind "$timeout_selected" /fixture \
+                --chdir / -- \
+                /bin/busybox sh -eu -c \
+                  '/bin/busybox printf timeout >/fixture/timeout-proof; /bin/busybox sleep 30' \
+                <"$busybox"
+            timeout_status=$?
+            set -e
+            printf 'M5_TIMEOUT_STATUS=%s\n' "$timeout_status"
+            [ "$timeout_status" -eq 124 ] || [ "$timeout_status" -eq 137 ]
+            finish_m5_case "$timeout_selected" timeout-proof
+
+            /bin/rmdir -- "$m5_root"
+            printf '%s\n' 'HYBRID_ISOLATION_PROBE=PASS'
+          ) >"$out/measurement.txt" 2>&1
+          probe_status=$?
+          set -e
+
+          printf 'PROBE_STATUS=%s\n' "$probe_status" >"$out/result.txt"
+          if [ "$probe_status" -eq 0 ]; then
+            printf 'HYBRID_ISOLATION_PROBE=PASS\n' >>"$out/result.txt"
+          else
+            printf 'HYBRID_ISOLATION_PROBE=FAIL\n' >>"$out/result.txt"
+          fi
+
+          (
+            cd "$out"
+            /usr/bin/find . -type f ! -name SHA256SUMS -print0 |
+              LC_ALL=C /usr/bin/sort -z |
+              /usr/bin/xargs -0 /usr/bin/sha256sum >SHA256SUMS
+          )
+          /usr/bin/cat "$out/measurement.txt"
+          /usr/bin/cat "$out/result.txt"
+          /usr/bin/cat "$out/SHA256SUMS"
+          exit "$probe_status"
+
+      - name: Upload raw probe evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: taoistfuchen-ubuntu-24.04-isolation-v2
+          path: runner-isolation-v2/
+          if-no-files-found: error
+          retention-days: 7
