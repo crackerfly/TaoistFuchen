@@ -188,7 +188,7 @@ jobs:
             [ "$staging_real" = "$staging_root" ]
             [ "$(/usr/bin/dirname -- "$staging_real")" = /tmp ]
             [ ! -L "$staging_root" ]
-            [ "$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%U:%G %a' -- "$staging_root" </dev/null)" = 'root:root 0700' ]
+            [ "$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%U:%G %a' -- "$staging_root" </dev/null)" = 'root:root 700' ]
             staging_identity=$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$staging_root" </dev/null)
             [ "${staging_identity#*:0:0:700:}" = directory ]
             root_busybox="$staging_root/busybox"
@@ -500,7 +500,7 @@ jobs:
             /usr/bin/sudo -n -- /usr/bin/test ! -L "$staging_real" </dev/null || return 1
             current_identity=$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$staging_real" </dev/null) || return 1
             [ "${current_identity#*:0:0:700:}" = directory ] || return 1
-            [ "$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%U:%G %a' -- "$staging_real" </dev/null)" = 'root:root 0700' ] || return 1
+            [ "$(/usr/bin/sudo -n -- /usr/bin/stat -Lc '%U:%G %a' -- "$staging_real" </dev/null)" = 'root:root 700' ] || return 1
             if [ -n "$staging_identity" ]; then
               [ "$current_identity" = "$staging_identity" ] || return 1
             else
