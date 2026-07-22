@@ -1,0 +1,1104 @@
+name: Measure TaoistFuchen S5 runner authorities r4
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/measure-runner-authorities-s5-20260722-r4.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Measure the persistent SDK hybrid boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Measure runner authorities and the three fixed lanes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
+
+          evidence="$PWD/runner-authority-s5-r4"
+          work_root="$RUNNER_TEMP/taoistfuchen-s5-r4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          result_file="$evidence/result"
+          authority_manifest="$evidence/authority-manifest.tsv"
+          authority_roots="$evidence/authority-roots.tsv"
+          authority_manifest_sha=
+          authority_roots_sha=
+          expected_loader_path=
+          expected_loader_canonical=
+          runner_uid=$UID
+          runner_gid=$(/usr/bin/id -g)
+          listener_pid=
+          listener_port=
+          listener_script=
+          client_script=
+          bwrap=
+          busybox=
+          BWRAP_SHA256=52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712
+          BWRAP_BUILD_ID=e1a0ef69f8106c7ee586e06a65f23e1b166bdcbe
+          BUSYBOX_SHA256=dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14
+          BUSYBOX_BUILD_ID=351ba74c282274bdd56e030c641d226cab5c14b7
+
+          on_exit() {
+            original_status=$?
+            trap - EXIT INT TERM HUP
+            set +e
+            cleanup_status=0
+            if [ -n "${listener_pid:-}" ]; then
+              if /bin/kill -0 "$listener_pid" 2>/dev/null; then
+                /bin/kill -TERM "$listener_pid" 2>/dev/null
+                kill_status=$?
+                if [ "$kill_status" -ne 0 ]; then
+                  cleanup_status=1
+                fi
+                wait "$listener_pid" 2>/dev/null
+                wait_status=$?
+                case "$wait_status" in
+                  0|143) ;;
+                  *) cleanup_status=1 ;;
+                esac
+              fi
+              if /bin/kill -0 "$listener_pid" 2>/dev/null; then
+                cleanup_status=1
+              fi
+            fi
+            if declare -F safe_cleanup_work_root >/dev/null; then
+              safe_cleanup_work_root
+              work_cleanup_status=$?
+            else
+              work_cleanup_status=0
+              if [ -e "$work_root" ]; then
+                work_cleanup_status=1
+              fi
+            fi
+            if [ "$work_cleanup_status" -ne 0 ]; then
+              cleanup_status=1
+            fi
+            if [ "$cleanup_status" -ne 0 ]; then
+              original_status=190
+            fi
+            if [ ! -d "$evidence" ]; then
+              /usr/bin/mkdir -m 0700 -- "$evidence"
+              emergency_mkdir_status=$?
+              if [ "$emergency_mkdir_status" -ne 0 ]; then
+                exit 193
+              fi
+            fi
+            if [ ! -f "$result_file" ]; then
+              : >"$result_file"
+            fi
+            if declare -F finalize_artifact >/dev/null; then
+              finalize_artifact "$original_status"
+              finalize_status=$?
+              if [ "$finalize_status" -ne 0 ]; then
+                original_status=191
+                /usr/bin/rm -f -- "$evidence/SHA256SUMS" "$evidence/.SHA256SUMS.tmp"
+                /usr/bin/sed -i '/^S5_RUNNER_AUTHORITY_R4=/d' "$result_file"
+                /usr/bin/printf '%s\n' 'FINALIZE_RECOVERY_STATUS=191' >>"$result_file"
+                /usr/bin/printf '%s\n' 'S5_RUNNER_AUTHORITY_R4=FAIL status=191' >>"$result_file"
+                /usr/bin/chmod 0600 -- "$result_file"
+              fi
+            else
+              /usr/bin/printf 'S5_RUNNER_AUTHORITY_R4=FAIL status=%s\n' "$original_status" >"$result_file"
+            fi
+            exit "$original_status"
+          }
+
+          trap on_exit EXIT
+          /usr/bin/mkdir -m 0700 -- "$evidence"
+          : >"$result_file"
+          /usr/bin/mkdir -m 0700 -- "$work_root"
+
+          sha256_of() {
+            /usr/bin/sha256sum -- "$1" | /usr/bin/awk '{print $1}'
+          }
+
+          build_id_of() {
+            /usr/bin/readelf -n -- "$1" 2>/dev/null |
+              /usr/bin/sed -n 's/.*Build ID: //p' |
+              /usr/bin/head -n 1
+          }
+
+          interp_of() {
+            /usr/bin/readelf -l -- "$1" |
+              /usr/bin/sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'
+          }
+
+          finalize_artifact() {
+            final_status=$1
+            set +e
+            if [ "$final_status" -eq 0 ]; then
+              /usr/bin/printf '%s\n' 'S5_RUNNER_AUTHORITY_R4=PASS' >>"$result_file"
+            else
+              /usr/bin/printf 'S5_RUNNER_AUTHORITY_R4=FAIL status=%s\n' "$final_status" >>"$result_file"
+            fi
+            /usr/bin/find "$evidence" -type d -exec /usr/bin/chmod 0700 -- {} \;
+            directory_chmod_status=$?
+            /usr/bin/find "$evidence" -type f -exec /usr/bin/chmod 0600 -- {} \;
+            file_chmod_status=$?
+            if [ "$directory_chmod_status" -ne 0 ] || [ "$file_chmod_status" -ne 0 ]; then
+              return 1
+            fi
+            mode_file="$evidence/modes.txt"
+            : >"$mode_file"
+            while IFS= read -r directory; do
+              directory_mode=$(/usr/bin/stat -Lc '%a' -- "$directory")
+              [ "$directory_mode" = 700 ] || return 1
+              directory_owner=$(/usr/bin/stat -Lc '%u:%g' -- "$directory")
+              [ "$directory_owner" = "$runner_uid:$runner_gid" ] || return 1
+              /usr/bin/printf 'DIRECTORY_MODE=0700 OWNER=%s PATH=%s\n' "$directory_owner" "$directory" >>"$mode_file"
+            done < <(/usr/bin/find "$evidence" -type d -print | LC_ALL=C /usr/bin/sort)
+            while IFS= read -r regular_file; do
+              file_mode=$(/usr/bin/stat -Lc '%a' -- "$regular_file")
+              [ "$file_mode" = 600 ] || return 1
+              file_owner=$(/usr/bin/stat -Lc '%u:%g' -- "$regular_file")
+              [ "$file_owner" = "$runner_uid:$runner_gid" ] || return 1
+              /usr/bin/printf 'FILE_MODE=0600 OWNER=%s PATH=%s\n' "$file_owner" "$regular_file" >>"$mode_file"
+            done < <(/usr/bin/find "$evidence" -type f ! -name SHA256SUMS -print | LC_ALL=C /usr/bin/sort)
+            /usr/bin/printf '%s\n' 'RUNNER_OWNERSHIP=PASS' >>"$mode_file"
+            /usr/bin/chmod 0600 -- "$mode_file"
+            digest_tmp="$evidence/.SHA256SUMS.tmp"
+            if (
+              cd "$evidence"
+              /usr/bin/find . -type f ! -name SHA256SUMS ! -name .SHA256SUMS.tmp -print0 |
+                LC_ALL=C /usr/bin/sort -z |
+                /usr/bin/xargs -0 -r /usr/bin/sha256sum >.SHA256SUMS.tmp || exit 1
+              /usr/bin/mv -f -- .SHA256SUMS.tmp SHA256SUMS || exit 1
+              /usr/bin/chmod 0600 SHA256SUMS || exit 1
+            ); then
+              return 0
+            fi
+            /usr/bin/rm -f -- "$digest_tmp"
+            return 1
+          }
+
+          safe_cleanup_work_root() {
+            [ -e "$work_root" ] || return 0
+            [ -d "$work_root" ] || return 1
+            [ ! -L "$work_root" ] || return 1
+            work_real=$(/usr/bin/readlink -f -- "$work_root") || return 1
+            temp_real=$(/usr/bin/readlink -f -- "$RUNNER_TEMP") || return 1
+            case "$work_real" in
+              "$temp_real"/taoistfuchen-s5-r4-*) ;;
+              *) return 1 ;;
+            esac
+            [ "$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "$work_real")" = \
+              "$runner_uid:$runner_gid:700:directory" ] || return 1
+            /usr/bin/rm -rf -- "$work_real" || return 1
+            [ ! -e "$work_real" ] || return 1
+          }
+
+          declare -A closure_seen=()
+          closure_index=0
+
+          record_elf_closure() {
+            requested_path=$1
+            package_override=${2:-}
+            version_override=${3:-}
+            canonical_path=$(/usr/bin/readlink -f -- "$requested_path") || return 1
+            case "$canonical_path" in
+              /*) ;;
+              *) return 1 ;;
+            esac
+            [ -f "$canonical_path" ] || return 1
+            if [ -n "${closure_seen[$canonical_path]+present}" ]; then
+              /usr/bin/printf 'ROOT\t%s\t%s\n' "$requested_path" "$canonical_path" >>"$authority_roots"
+              return 0
+            fi
+            closure_seen[$canonical_path]=1
+            closure_index=$((closure_index + 1))
+            prefix=$(/usr/bin/printf '%s/elf/%04d' "$evidence" "$closure_index")
+            ldd_stdout="$prefix.ldd.stdout"
+            ldd_stderr="$prefix.ldd.stderr"
+            ldd_status_file="$prefix.ldd.status"
+            needed_file="$prefix.needed"
+            parsed_file="$prefix.closure.tsv"
+            /usr/bin/mkdir -p -m 0700 -- "$evidence/elf"
+            : >"$parsed_file"
+
+            set +e
+            /usr/bin/ldd "$canonical_path" >"$ldd_stdout" 2>"$ldd_stderr"
+            ldd_status=$?
+            set -e
+            /usr/bin/printf '%s\n' "$ldd_status" >"$ldd_status_file"
+            [ "$ldd_status" -eq 0 ] || return 1
+            [ ! -s "$ldd_stderr" ] || return 1
+            if /usr/bin/grep -F "=> not found" "$ldd_stdout" >/dev/null; then
+              /usr/bin/printf 'NEEDED_UNRESOLVED=%s\n' "$canonical_path" >>"$parsed_file"
+              return 1
+            fi
+
+            requested_stat=$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$requested_path") || return 1
+            canonical_stat=$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$canonical_path") || return 1
+            elf_sha=$(sha256_of "$canonical_path") || return 1
+            build_id=$(build_id_of "$canonical_path")
+            if [ -z "$build_id" ]; then
+              build_id=none
+            fi
+            pt_interp=$(interp_of "$canonical_path")
+            if [ -z "$pt_interp" ]; then
+              pt_interp=none
+            fi
+            if [ -n "$package_override" ]; then
+              package_name=$package_override
+              package_version=$version_override
+              package_identity="$package_name|$package_version"
+            else
+              package_line=$(/usr/bin/dpkg-query -S "$canonical_path" 2>/dev/null | /usr/bin/head -n 1)
+              if [ -z "$package_line" ]; then
+                package_line=$(/usr/bin/dpkg-query -S "$requested_path" 2>/dev/null | /usr/bin/head -n 1)
+              fi
+              [ -n "$package_line" ] || return 1
+              package_name=${package_line%%: *}
+              package_identity=$(/usr/bin/dpkg-query -W -f='${binary:Package}|${Version}' "$package_name") || return 1
+              package_name=${package_identity%%|*}
+              package_version=${package_identity#*|}
+            fi
+            [ -n "$package_name" ] || return 1
+            [ -n "$package_version" ] || return 1
+            /usr/bin/readelf -d -- "$canonical_path" |
+              /usr/bin/sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' >"$needed_file"
+
+            mapped_re='^[[:space:]]*([^[:space:]=]+)[[:space:]]+=>[[:space:]]+(/[^[:space:]()]*)[[:space:]]+\(0x[0-9a-fA-F]+\)$'
+            direct_re='^[[:space:]]*(/[^[:space:]()]*)[[:space:]]+\(0x[0-9a-fA-F]+\)$'
+            vdso_re='^[[:space:]]*linux-vdso\.so\.1[[:space:]]+\(0x[0-9a-fA-F]+\)$'
+            while IFS= read -r line; do
+              if [[ "$line" =~ $vdso_re ]]; then
+                /usr/bin/printf '%s\n' 'KERNEL_OBJECT=linux-vdso.so.1' >>"$parsed_file"
+              elif [[ "$line" =~ $mapped_re ]]; then
+                dependency_name=${BASH_REMATCH[1]}
+                child=${BASH_REMATCH[2]}
+                case "$child" in
+                  /*) ;;
+                  *) return 1 ;;
+                esac
+                [ -f "$child" ] || return 1
+                [ "$(/usr/bin/basename -- "$child")" = "$dependency_name" ] || return 1
+                /usr/bin/printf 'MAP\t%s\t%s\n' "$dependency_name" "$child" >>"$parsed_file"
+              elif [[ "$line" =~ $direct_re ]]; then
+                child=${BASH_REMATCH[1]}
+                dependency_name=$(/usr/bin/basename -- "$expected_loader_path")
+                [ "$(/usr/bin/basename -- "$child")" = "$dependency_name" ] || return 1
+                [ "$child" = "$expected_loader_path" ] || return 1
+                /usr/bin/printf 'LOADER\t%s\t%s\n' "$dependency_name" "$child" >>"$parsed_file"
+              elif [[ "$line" =~ ^[[:space:]]*statically[[:space:]]+linked[[:space:]]*$ ]] &&
+                   [ "$canonical_path" = "$expected_loader_canonical" ]; then
+                /usr/bin/printf '%s\n' 'LOADER_SELF=statically-linked-report' >>"$parsed_file"
+              else
+                /usr/bin/printf 'LDD_MALFORMED_LINE=%s\n' "$line" >>"$parsed_file"
+                return 1
+              fi
+            done <"$ldd_stdout"
+
+            while IFS= read -r dependency_name; do
+              [ -n "$dependency_name" ] || continue
+              mapped_count=$(/usr/bin/awk -F '\t' -v wanted="$dependency_name" \
+                '($1 == "MAP" || $1 == "LOADER") && $2 == wanted { count++ } END { print count + 0 }' \
+                "$parsed_file")
+              [ "$mapped_count" -eq 1 ] || return 1
+              child=$(/usr/bin/awk -F '\t' -v wanted="$dependency_name" \
+                '($1 == "MAP" || $1 == "LOADER") && $2 == wanted { print $3 }' \
+                "$parsed_file")
+              [ -n "$child" ] || return 1
+              [ "$(/usr/bin/basename -- "$child")" = "$dependency_name" ] || return 1
+            done <"$needed_file"
+
+            /usr/bin/printf 'ROOT\t%s\t%s\n' "$requested_path" "$canonical_path" >>"$authority_roots"
+            /usr/bin/printf 'ELF\t%s\t%s\t%s\t%s\t%s\n' \
+              "$requested_path" "$canonical_path" "$elf_sha" "$canonical_stat" "$package_identity" >>"$authority_manifest"
+            {
+              /usr/bin/printf 'requested_path=%s\ncanonical_path=%s\n' "$requested_path" "$canonical_path"
+              /usr/bin/printf 'REQUESTED_STAT=%s\nCANONICAL_STAT=%s\n' "$requested_stat" "$canonical_stat"
+              /usr/bin/printf 'SHA256=%s\nBUILD_ID=%s\nPT_INTERP=%s\n' "$elf_sha" "$build_id" "$pt_interp"
+              /usr/bin/printf 'PACKAGE=%s\nVERSION=%s\n' "$package_name" "$package_version"
+              /usr/bin/printf 'LDD_STATUS=%s\nLDD_STDOUT=%s\nLDD_STDERR=%s\n' \
+                "$ldd_status" "$ldd_stdout" "$ldd_stderr"
+            } >"$prefix.identity"
+
+            while IFS=$'\t' read -r record dependency_name child; do
+              case "$record" in
+                MAP|LOADER)
+                  record_elf_closure "$child" || return 1
+                  ;;
+              esac
+            done <"$parsed_file"
+          }
+
+          record_plain_authority() {
+            requested_path=$1
+            destination=$2
+            canonical_path=$(/usr/bin/readlink -f -- "$requested_path") || return 1
+            [ -f "$canonical_path" ] || return 1
+            plain_stat=$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$canonical_path") || return 1
+            plain_sha=$(sha256_of "$canonical_path") || return 1
+            package_line=$(/usr/bin/dpkg-query -S "$canonical_path" 2>/dev/null | /usr/bin/head -n 1)
+            if [ -z "$package_line" ]; then
+              package_line=$(/usr/bin/dpkg-query -S "$requested_path" 2>/dev/null | /usr/bin/head -n 1)
+            fi
+            [ -n "$package_line" ] || return 1
+            package_name=${package_line%%: *}
+            package_identity=$(/usr/bin/dpkg-query -W -f='${binary:Package}|${Version}' "$package_name") || return 1
+            {
+              /usr/bin/printf 'requested_path=%s\ncanonical_path=%s\n' "$requested_path" "$canonical_path"
+              /usr/bin/printf 'STAT=%s\nSHA256=%s\nPACKAGE=%s\n' "$plain_stat" "$plain_sha" "$package_identity"
+            } >"$destination"
+            /usr/bin/printf 'PLAIN\t%s\t%s\t%s\t%s\t%s\n' \
+              "$requested_path" "$canonical_path" "$plain_sha" "$plain_stat" "$package_identity" >>"$authority_manifest"
+          }
+
+          record_generated_authority() {
+            requested_path=$1
+            canonical_path=$(/usr/bin/readlink -f -- "$requested_path") || return 1
+            [ "$canonical_path" = "$requested_path" ] || return 1
+            [ -f "$canonical_path" ] || return 1
+            generated_stat=$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$canonical_path") || return 1
+            generated_sha=$(sha256_of "$canonical_path") || return 1
+            /usr/bin/printf 'GENERATED\t%s\t%s\t%s\t%s\tgenerated|r4\n' \
+              "$requested_path" "$canonical_path" "$generated_sha" "$generated_stat" >>"$authority_manifest"
+          }
+
+          validate_authority_record() {
+            record=$1
+            requested_path=$2
+            canonical_path=$3
+            expected_sha=$4
+            expected_stat=$5
+            package_identity=$6
+            case "$record" in
+              ELF|PLAIN|GENERATED) ;;
+              *) return 1 ;;
+            esac
+            [ -n "$requested_path" ] || return 1
+            [ -n "$canonical_path" ] || return 1
+            [ -n "$expected_sha" ] || return 1
+            [ -n "$expected_stat" ] || return 1
+            [ -n "$package_identity" ] || return 1
+            [ "$(/usr/bin/readlink -f -- "$requested_path")" = "$canonical_path" ] || return 1
+            [ "$(sha256_of "$canonical_path")" = "$expected_sha" ] || return 1
+            [ "$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$canonical_path")" = "$expected_stat" ] || return 1
+          }
+
+          validate_authority_manifest() {
+            manifest_path=$1
+            expected_manifest_sha=$2
+            roots_path=$3
+            expected_roots_sha=$4
+            [ -f "$manifest_path" ] || return 1
+            [ -f "$roots_path" ] || return 1
+            [ "$(sha256_of "$manifest_path")" = "$expected_manifest_sha" ] || return 1
+            [ "$(sha256_of "$roots_path")" = "$expected_roots_sha" ] || return 1
+            manifest_records=0
+            while IFS=$'\t' read -r record requested_path canonical_path expected_sha expected_stat package_identity extra; do
+              [ -z "$extra" ] || return 1
+              validate_authority_record "$record" "$requested_path" "$canonical_path" \
+                "$expected_sha" "$expected_stat" "$package_identity" || return 1
+              manifest_records=$((manifest_records + 1))
+            done <"$manifest_path"
+            [ "$manifest_records" -gt 0 ] || return 1
+            root_records=0
+            while IFS=$'\t' read -r record requested_path canonical_path extra; do
+              [ -z "$extra" ] || return 1
+              [ "$record" = ROOT ] || return 1
+              [ -n "$requested_path" ] || return 1
+              [ -n "$canonical_path" ] || return 1
+              [ "$(/usr/bin/readlink -f -- "$requested_path")" = "$canonical_path" ] || return 1
+              root_records=$((root_records + 1))
+            done <"$roots_path"
+            [ "$root_records" -gt 0 ] || return 1
+          }
+
+          run_authority_drift_negative() {
+            drift_label=$1
+            drift_source=$2
+            drift_dir="$work_root/drift-negative-$drift_label"
+            drift_copy="$drift_dir/$drift_label"
+            drift_manifest="$drift_dir/authority-manifest.tsv"
+            drift_roots="$drift_dir/authority-roots.tsv"
+            /usr/bin/mkdir -m 0700 -- "$drift_dir"
+            /usr/bin/cp -- "$drift_source" "$drift_copy"
+            /usr/bin/chmod 0700 -- "$drift_copy"
+            [ "$(/usr/bin/stat -Lc '%u:%g' -- "$drift_copy")" = "$runner_uid:$runner_gid" ]
+            drift_canonical=$(/usr/bin/readlink -f -- "$drift_copy")
+            [ "$drift_canonical" = "$drift_copy" ]
+            drift_sha=$(sha256_of "$drift_copy")
+            drift_stat=$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$drift_copy")
+            /usr/bin/printf 'ELF\t%s\t%s\t%s\t%s\tsynthetic-drift|r4\n' \
+              "$drift_copy" "$drift_canonical" "$drift_sha" "$drift_stat" >"$drift_manifest"
+            /usr/bin/printf 'ROOT\t%s\t%s\n' "$drift_copy" "$drift_canonical" >"$drift_roots"
+            drift_manifest_sha=$(sha256_of "$drift_manifest")
+            drift_roots_sha=$(sha256_of "$drift_roots")
+            validate_authority_manifest "$drift_manifest" "$drift_manifest_sha" \
+              "$drift_roots" "$drift_roots_sha"
+            /usr/bin/printf '\nTAOISTFUCHEN_AUTHORITY_DRIFT_%s\n' "$drift_label" >>"$drift_copy"
+            set +e
+            validate_authority_manifest "$drift_manifest" "$drift_manifest_sha" \
+              "$drift_roots" "$drift_roots_sha" \
+              >"$evidence/drift-$drift_label.validator.stdout" \
+              2>"$evidence/drift-$drift_label.validator.stderr"
+            authority_drift_status=$?
+            set -e
+            /usr/bin/printf '%s\n' "$authority_drift_status" >"$evidence/drift-$drift_label.status"
+            [ "$authority_drift_status" -ne 0 ]
+          }
+
+          run_authority_drift_negatives() {
+            run_authority_drift_negative unshare /usr/bin/unshare
+            unshare_drift_status=$authority_drift_status
+            run_authority_drift_negative setpriv /usr/bin/setpriv
+            setpriv_drift_status=$authority_drift_status
+            run_authority_drift_negative loader "$expected_loader_canonical"
+            loader_drift_status=$authority_drift_status
+            {
+              /usr/bin/printf 'UNSHARE_DRIFT_STATUS=%s\n' "$unshare_drift_status"
+              /usr/bin/printf 'SETPRIV_DRIFT_STATUS=%s\n' "$setpriv_drift_status"
+              /usr/bin/printf 'LOADER_DRIFT_STATUS=%s\n' "$loader_drift_status"
+              /usr/bin/printf '%s\n' 'AUTHORITY_DRIFT_REJECTION=PASS'
+            } >"$evidence/authority-drift-rejection.txt"
+          }
+
+          record_runner_facts() {
+            facts="$evidence/runner-facts.txt"
+            {
+              /usr/bin/printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS-unset}" "${ImageVersion-unset}"
+              /usr/bin/printf 'RUNNER_UID=%s\nRUNNER_GID=%s\n' "$runner_uid" "$runner_gid"
+              /usr/bin/uname -a
+              /usr/bin/uname -m
+              /usr/bin/cat /etc/os-release
+              /usr/bin/printf 'RUNNER_PASSWD=%s\n' "$(/usr/bin/getent passwd "$runner_uid")"
+              /usr/bin/printf 'RUNNER_GROUP=%s\n' "$(/usr/bin/getent group "$runner_gid")"
+              /usr/bin/id
+              /usr/bin/printf 'HOST_USER_NS=%s\nHOST_MNT_NS=%s\nHOST_NET_NS=%s\n' \
+                "$(/usr/bin/readlink /proc/self/ns/user)" \
+                "$(/usr/bin/readlink /proc/self/ns/mnt)" \
+                "$(/usr/bin/readlink /proc/self/ns/net)"
+              /usr/bin/printf 'LSM_CURRENT='
+              /usr/bin/cat /proc/self/attr/current
+              if [ -r /sys/kernel/security/lsm ]; then
+                /usr/bin/printf 'LSM_LIST='
+                /usr/bin/cat /sys/kernel/security/lsm
+              else
+                /usr/bin/printf '%s\n' 'LSM_LIST=UNAVAILABLE'
+              fi
+              if [ -r /sys/module/apparmor/parameters/enabled ]; then
+                /usr/bin/printf 'APPARMOR_ENABLED='
+                /usr/bin/cat /sys/module/apparmor/parameters/enabled
+              else
+                /usr/bin/printf '%s\n' 'APPARMOR_ENABLED=UNAVAILABLE'
+              fi
+              for sysctl_file in \
+                /proc/sys/user/max_user_namespaces \
+                /proc/sys/kernel/unprivileged_userns_clone \
+                /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+              do
+                if [ -r "$sysctl_file" ]; then
+                  /usr/bin/printf 'SYSCTL %s=' "$sysctl_file"
+                  /usr/bin/cat "$sysctl_file"
+                else
+                  /usr/bin/printf 'SYSCTL %s=UNAVAILABLE\n' "$sysctl_file"
+                fi
+              done
+            } >"$facts"
+            /usr/bin/sudo -V >"$evidence/sudo-version.txt"
+            set +e
+            /usr/bin/sudo -n -l \
+              >"$evidence/sudo-policy-runner.stdout" \
+              2>"$evidence/sudo-policy-runner.stderr"
+            sudo_policy_runner_status=$?
+            set -e
+            /usr/bin/printf '%s\n' "$sudo_policy_runner_status" >"$evidence/sudo-policy-runner.status"
+            [ "$sudo_policy_runner_status" -eq 0 ]
+            /usr/bin/printf '%s\n' 'SUDO_POLICY_RUNNER_STATUS=0' >>"$result_file"
+
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/sudo -l \
+              >"$evidence/sudo-policy-root-after-escalation.stdout" \
+              2>"$evidence/sudo-policy-root-after-escalation.stderr"
+            sudo_policy_root_status=$?
+            set -e
+            /usr/bin/printf '%s\n' "$sudo_policy_root_status" \
+              >"$evidence/sudo-policy-root-after-escalation.status"
+            [ "$sudo_policy_root_status" -eq 0 ]
+            /usr/bin/printf '%s\n' 'SUDO_POLICY_ROOT_AFTER_ESCALATION_STATUS=0' >>"$result_file"
+
+            loader_env_raw="$work_root/loader-env-sanitization.raw"
+            loader_env_stderr="$work_root/loader-env-sanitization.stderr"
+            loader_env_matches="$evidence/loader-env-sanitization.ld-matches"
+            set +e
+            LD_PRELOAD=/taoistfuchen-invalid/preload.so \
+            LD_LIBRARY_PATH=/taoistfuchen-invalid/library \
+            LD_AUDIT=/taoistfuchen-invalid/audit.so \
+              /usr/bin/sudo -n -- /usr/bin/env \
+              >"$loader_env_raw" \
+              2>"$loader_env_stderr"
+            loader_env_status=$?
+            set -e
+            [ "$loader_env_status" -eq 0 ]
+            set +e
+            /usr/bin/grep -E '^(LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT)=' \
+              "$loader_env_raw" >"$loader_env_matches"
+            loader_env_match_status=$?
+            set -e
+            [ "$loader_env_match_status" -eq 1 ]
+            [ ! -s "$loader_env_matches" ]
+            {
+              /usr/bin/printf '%s\n' 'LOADER_ENV_LD_PRELOAD=/taoistfuchen-invalid/preload.so'
+              /usr/bin/printf '%s\n' 'LOADER_ENV_LD_LIBRARY_PATH=/taoistfuchen-invalid/library'
+              /usr/bin/printf '%s\n' 'LOADER_ENV_LD_AUDIT=/taoistfuchen-invalid/audit.so'
+              /usr/bin/printf '%s\n' 'LOADER_ENV_MATCH_STATUS=1'
+              /usr/bin/printf '%s\n' 'LOADER_ENV_SANITIZATION_STATUS=0'
+              /usr/bin/printf '%s\n' 'LOADER_ENV_SANITIZATION=PASS'
+            } >"$evidence/loader-env-sanitization.status"
+            /usr/bin/sudo -n -- /usr/bin/id >"$evidence/sudo-root-identity.txt"
+            {
+              /usr/bin/sudo -n -- /usr/bin/stat -Lc 'PATH=/etc/sudoers TYPE=%F MODE=%a OWNER=%u:%g SIZE=%s' /etc/sudoers
+              /usr/bin/sudo -n -- /usr/bin/sha256sum /etc/sudoers
+              for sudo_config in /etc/sudo.conf /etc/sudo_logsrvd.conf /etc/sudo_sendlog.conf; do
+                if [ -e "$sudo_config" ]; then
+                  /usr/bin/sudo -n -- /usr/bin/stat -Lc 'PATH=%n TYPE=%F MODE=%a OWNER=%u:%g SIZE=%s' "$sudo_config"
+                  /usr/bin/sudo -n -- /usr/bin/sha256sum "$sudo_config"
+                else
+                  /usr/bin/printf 'PATH=%s STATE=ABSENT\n' "$sudo_config"
+                fi
+              done
+              /usr/bin/sudo -n -- /usr/bin/find /etc/sudoers.d -maxdepth 1 -type f -exec /usr/bin/stat -Lc 'PATH=%n TYPE=%F MODE=%a OWNER=%u:%g SIZE=%s' {} \;
+              /usr/bin/sudo -n -- /usr/bin/find /etc/sudoers.d -maxdepth 1 -type f -exec /usr/bin/sha256sum {} \;
+            } >"$evidence/sudo-policy-files.txt"
+            {
+              for config in /etc/passwd /etc/group /etc/nsswitch.conf; do
+                /usr/bin/stat -Lc 'PATH=%n TYPE=%F MODE=%a OWNER=%u:%g SIZE=%s' "$config"
+                /usr/bin/sha256sum "$config"
+              done
+            } >"$evidence/identity-config.txt"
+          }
+
+          prepare_locked_inputs() {
+            download_root="$work_root/downloads"
+            extract_root="$work_root/extracted"
+            /usr/bin/mkdir -m 0700 -- "$download_root" "$extract_root" "$extract_root/bwrap" "$extract_root/busybox"
+            bwrap_deb="$download_root/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
+            busybox_deb="$download_root/busybox-static_1.36.1-6ubuntu3.1_amd64.deb"
+            /usr/bin/curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+              'https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb' \
+              --output "$bwrap_deb"
+            /usr/bin/printf '%s  %s\n' \
+              1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a "$bwrap_deb" |
+              /usr/bin/sha256sum -c -
+            [ "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Package)" = bubblewrap ]
+            [ "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Version)" = 0.9.0-1ubuntu0.1 ]
+            /usr/bin/dpkg-deb -x "$bwrap_deb" "$extract_root/bwrap"
+            bwrap="$extract_root/bwrap/usr/bin/bwrap"
+            [ -f "$bwrap" ]
+            [ "$(sha256_of "$bwrap")" = "$BWRAP_SHA256" ]
+            [ "$(build_id_of "$bwrap")" = "$BWRAP_BUILD_ID" ]
+
+            /usr/bin/curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+              'https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_amd64.deb' \
+              --output "$busybox_deb"
+            /usr/bin/printf '%s  %s\n' \
+              944b2728f53ceb3916cec2c962873c9951e612408099601751db2a0a5d81e0ed "$busybox_deb" |
+              /usr/bin/sha256sum -c -
+            [ "$(/usr/bin/dpkg-deb -f "$busybox_deb" Package)" = busybox-static ]
+            [ "$(/usr/bin/dpkg-deb -f "$busybox_deb" Version)" = 1:1.36.1-6ubuntu3.1 ]
+            /usr/bin/dpkg-deb -x "$busybox_deb" "$extract_root/busybox"
+            busybox_count=$(/usr/bin/find "$extract_root/busybox" -type f -name busybox | /usr/bin/awk 'END { print NR }')
+            [ "$busybox_count" -eq 1 ]
+            busybox=$(/usr/bin/find "$extract_root/busybox" -type f -name busybox)
+            [ -f "$busybox" ]
+            [ "$(sha256_of "$busybox")" = "$BUSYBOX_SHA256" ]
+            [ "$(build_id_of "$busybox")" = "$BUSYBOX_BUILD_ID" ]
+            [ -z "$(interp_of "$busybox")" ]
+            {
+              /usr/bin/printf 'BWRAP_DEB_SHA256=%s\nBWRAP_BINARY_SHA256=%s\nBWRAP_BUILD_ID=%s\n' \
+                "$(sha256_of "$bwrap_deb")" "$(sha256_of "$bwrap")" "$(build_id_of "$bwrap")"
+              /usr/bin/printf 'BWRAP_STAT=%s\n' "$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' "$bwrap")"
+              /usr/bin/printf 'BUSYBOX_DEB_SHA256=%s\nBUSYBOX_BINARY_SHA256=%s\nBUSYBOX_BUILD_ID=%s\n' \
+                "$(sha256_of "$busybox_deb")" "$(sha256_of "$busybox")" "$(build_id_of "$busybox")"
+              /usr/bin/printf 'BUSYBOX_STAT=%s\nBUSYBOX_STATIC=PASS\n' \
+                "$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' "$busybox")"
+            } >"$evidence/locked-inputs.txt"
+          }
+
+          initialize_authorities() {
+            : >"$authority_manifest"
+            : >"$authority_roots"
+            /usr/bin/mkdir -m 0700 -- "$evidence/elf"
+            expected_loader_path=$(interp_of /bin/sh)
+            [ -n "$expected_loader_path" ]
+            [ -f "$expected_loader_path" ]
+            expected_loader_canonical=$(/usr/bin/readlink -f -- "$expected_loader_path")
+            [ -f "$expected_loader_canonical" ]
+            authority_paths=(
+              /usr/bin/sudo /usr/bin/unshare /usr/bin/setpriv /usr/bin/flock
+              /bin/sh /usr/bin/bash /usr/bin/nsenter /usr/bin/python3 /usr/bin/perl
+              /usr/bin/curl /usr/bin/dpkg-deb /usr/bin/dpkg-query /usr/bin/readelf /usr/bin/sha256sum
+              /usr/bin/stat /usr/bin/readlink /usr/bin/awk /usr/bin/grep /usr/bin/sed
+              /usr/bin/find /usr/bin/sort /usr/bin/xargs /usr/bin/chmod /usr/bin/mkdir
+              /usr/bin/rm /usr/bin/mv /usr/bin/head /usr/bin/basename /usr/bin/id
+              /usr/bin/uname /usr/bin/getent /usr/bin/file /usr/bin/cp /bin/kill /bin/sleep
+              /usr/bin/true /usr/bin/env /usr/bin/cat /usr/bin/printf /usr/bin/test
+            )
+            for authority_path in "${authority_paths[@]}"; do
+              record_elf_closure "$authority_path"
+            done
+            for optional_authority_path in \
+              /usr/bin/tar /usr/bin/zstd /usr/bin/xz /usr/bin/gzip /usr/bin/bzip2
+            do
+              if [ -x "$optional_authority_path" ]; then
+                record_elf_closure "$optional_authority_path"
+              fi
+            done
+            sudoers_plugin=$(/usr/bin/dpkg-query -L sudo | /usr/bin/grep '/sudoers\.so$' | /usr/bin/head -n 1)
+            [ -n "$sudoers_plugin" ]
+            record_elf_closure "$sudoers_plugin"
+            sudoers_plugin_canonical=$(/usr/bin/readlink -f -- "$sudoers_plugin")
+            sudoers_plugin_package_line=$(/usr/bin/dpkg-query -S "$sudoers_plugin_canonical" | /usr/bin/head -n 1)
+            [ -n "$sudoers_plugin_package_line" ]
+            sudoers_plugin_package_name=${sudoers_plugin_package_line%%: *}
+            sudoers_plugin_package=$(/usr/bin/dpkg-query -W -f='${binary:Package}|${Version}' "$sudoers_plugin_package_name")
+            {
+              /usr/bin/printf 'REQUESTED_PATH=%s\nCANONICAL_PATH=%s\n' \
+                "$sudoers_plugin" "$sudoers_plugin_canonical"
+              /usr/bin/printf 'STAT=%s\nSHA256=%s\nBUILD_ID=%s\nPACKAGE=%s\n' \
+                "$(/usr/bin/stat -Lc '%F|%a|%u|%g|%s' -- "$sudoers_plugin_canonical")" \
+                "$(sha256_of "$sudoers_plugin_canonical")" \
+                "$(build_id_of "$sudoers_plugin_canonical")" \
+                "$sudoers_plugin_package"
+            } >"$evidence/sudoers-plugin-identity.txt"
+            record_elf_closure "$bwrap" bubblewrap 0.9.0-1ubuntu0.1
+            record_plain_authority /usr/bin/ldd "$evidence/ldd-authority.txt"
+            record_generated_authority "$listener_script"
+            record_generated_authority "$client_script"
+            record_generated_authority "$sdk_normal_script"
+            record_generated_authority "$sdk_exit_script"
+            record_generated_authority "$sdk_term_script"
+            record_generated_authority "$sdk_normal_dir/tcp-client.py"
+            record_generated_authority "$sdk_normal_dir/fixture.txt"
+            authority_manifest_sha=$(sha256_of "$authority_manifest")
+            authority_roots_sha=$(sha256_of "$authority_roots")
+            /usr/bin/printf '%s  authority-manifest.tsv\n' "$authority_manifest_sha" >"$evidence/authority-manifest.sha256"
+            /usr/bin/printf '%s  authority-roots.tsv\n' "$authority_roots_sha" >"$evidence/authority-roots.sha256"
+          }
+
+          verify_locked_inputs() {
+            [ "$(sha256_of "$bwrap")" = "$BWRAP_SHA256" ] || return 1
+            [ "$(build_id_of "$bwrap")" = "$BWRAP_BUILD_ID" ] || return 1
+            [ "$(sha256_of "$busybox")" = "$BUSYBOX_SHA256" ] || return 1
+            [ "$(build_id_of "$busybox")" = "$BUSYBOX_BUILD_ID" ] || return 1
+          }
+
+          revalidate_authorities() {
+            lane=$1
+            lane_dir=$2
+            validate_authority_manifest "$authority_manifest" "$authority_manifest_sha" "$authority_roots" "$authority_roots_sha" || return 1
+            verify_locked_inputs || return 1
+            [ "$(/usr/bin/stat -Lc '%a' -- "$lane_dir")" = 700 ] || return 1
+            [ "$(/usr/bin/stat -Lc '%u:%g' -- "$lane_dir")" = "$runner_uid:$runner_gid" ] || return 1
+            case "$lane" in
+              normal) marker=AUTHORITY_REVALIDATION_BEFORE_normal=PASS ;;
+              exit37) marker=AUTHORITY_REVALIDATION_BEFORE_exit37=PASS ;;
+              term143) marker=AUTHORITY_REVALIDATION_BEFORE_term143=PASS ;;
+              *) return 1 ;;
+            esac
+            /usr/bin/printf '%s\n' "$marker" >"$lane_dir/authority-revalidation.txt"
+            /usr/bin/printf '%s\n' "$marker" >>"$result_file"
+          }
+
+          write_support_and_lane_scripts() {
+            /usr/bin/mkdir -m 0700 -- "$evidence/helpers" "$evidence/lanes"
+            listener_script="$evidence/helpers/listener.py"
+            client_script="$evidence/helpers/tcp-client.py"
+            /usr/bin/cat >"$listener_script" <<'PY'
+          import pathlib
+          import socket
+          import sys
+
+          listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          listener.bind(("127.0.0.1", 0))
+          listener.listen()
+          pathlib.Path(sys.argv[1]).write_text(str(listener.getsockname()[1]), encoding="ascii")
+          while True:
+              connection, _ = listener.accept()
+              connection.close()
+          PY
+            /usr/bin/cat >"$client_script" <<'PY'
+          import socket
+          import sys
+
+          connection = socket.create_connection((sys.argv[1], int(sys.argv[2])), 3)
+          connection.close()
+          PY
+            /usr/bin/chmod 0700 -- "$listener_script" "$client_script"
+
+            sdk_normal_dir="$evidence/lanes/normal"
+            sdk_exit_dir="$evidence/lanes/exit37"
+            sdk_term_dir="$evidence/lanes/term143"
+            /usr/bin/mkdir -m 0700 -- "$sdk_normal_dir" "$sdk_exit_dir" "$sdk_term_dir"
+            sdk_normal_script="$sdk_normal_dir/run-normal.sh"
+            sdk_exit_script="$sdk_exit_dir/run-exit37.sh"
+            sdk_term_script="$sdk_term_dir/run-term143.sh"
+            /usr/bin/cp -- "$client_script" "$sdk_normal_dir/tcp-client.py"
+            /usr/bin/printf '%s\n' 'fixed S5 runner-owned fixture input' >"$sdk_normal_dir/fixture.txt"
+            /usr/bin/chmod 0600 -- "$sdk_normal_dir/fixture.txt"
+            /usr/bin/chmod 0700 -- "$sdk_normal_dir/tcp-client.py"
+            fixture_hash=$(sha256_of "$sdk_normal_dir/fixture.txt")
+
+            /usr/bin/cat >"$sdk_normal_script" <<'SH'
+          #!/bin/sh
+          set -eu
+          umask 077
+          runner_uid_arg=$1
+          runner_gid_arg=$2
+          host_net_arg=$3
+          host_mnt_arg=$4
+          host_user_arg=$5
+          host_proc_dev_arg=$6
+          fixture_hash_arg=$7
+          listener_port_arg=$8
+          parent_pid_arg=$9
+          normal_dir=${10}
+          status_file="$normal_dir/status.txt"
+          mountinfo_file="$normal_dir/mountinfo.txt"
+          namespace_file="$normal_dir/namespaces.txt"
+          /usr/bin/cat /proc/self/status >"$status_file"
+          /usr/bin/cat /proc/self/mountinfo >"$mountinfo_file"
+          child_net=$(/usr/bin/readlink /proc/self/ns/net)
+          child_mnt=$(/usr/bin/readlink /proc/self/ns/mnt)
+          child_user=$(/usr/bin/readlink /proc/self/ns/user)
+          child_proc_dev=$(/usr/bin/stat -Lc '%d' /proc)
+          /usr/bin/printf 'NET=%s\nMNT=%s\nUSER=%s\nHOST_PROC_DEV=%s\nCHILD_PROC_DEV=%s\n' \
+            "$child_net" "$child_mnt" "$child_user" "$host_proc_dev_arg" "$child_proc_dev" >"$namespace_file"
+          [ "$child_net" != "$host_net_arg" ]
+          [ "$child_mnt" != "$host_mnt_arg" ]
+          [ "$child_user" = "$host_user_arg" ]
+          /usr/bin/printf '%s\n' 'CHILD_NET_NAMESPACE=PRIVATE' 'CHILD_MOUNT_NAMESPACE=PRIVATE' \
+            'CHILD_USER_NAMESPACE=UNCHANGED' 'PROC_DEVICE_DIAGNOSTIC=RECORDED' \
+            >"$normal_dir/namespace-proof.txt"
+          uid_values=$(/usr/bin/awk '$1 == "Uid:" { print $2, $3, $4, $5 }' "$status_file")
+          gid_values=$(/usr/bin/awk '$1 == "Gid:" { print $2, $3, $4, $5 }' "$status_file")
+          [ "$uid_values" = "$runner_uid_arg $runner_uid_arg $runner_uid_arg $runner_uid_arg" ]
+          [ "$gid_values" = "$runner_gid_arg $runner_gid_arg $runner_gid_arg $runner_gid_arg" ]
+          /usr/bin/awk '$1 == "Groups:" { found=1; if (NF != 1) exit 1 } END { if (!found) exit 1 }' "$status_file"
+          cap_inh=$(/usr/bin/awk '$1 == "CapInh:" { print $2 }' "$status_file")
+          cap_prm=$(/usr/bin/awk '$1 == "CapPrm:" { print $2 }' "$status_file")
+          cap_eff=$(/usr/bin/awk '$1 == "CapEff:" { print $2 }' "$status_file")
+          cap_bnd=$(/usr/bin/awk '$1 == "CapBnd:" { print $2 }' "$status_file")
+          cap_amb=$(/usr/bin/awk '$1 == "CapAmb:" { print $2 }' "$status_file")
+          no_new_privs=$(/usr/bin/awk '$1 == "NoNewPrivs:" { print $2 }' "$status_file")
+          [ "$cap_inh" = 0000000000000000 ]
+          [ "$cap_prm" = 0000000000000000 ]
+          [ "$cap_eff" = 0000000000000000 ]
+          [ "$cap_amb" = 0000000000000000 ]
+          [ "$no_new_privs" = 1 ]
+          {
+            /usr/bin/printf '%s\n' 'UID_FOUR_COLUMNS=PASS' 'GID_FOUR_COLUMNS=PASS' 'SUPPLEMENTARY_GROUPS=EMPTY'
+            /usr/bin/printf 'CapInh=%s\nCapPrm=%s\nCapEff=%s\nCapAmb=%s\nNoNewPrivs=%s\n' \
+              "$cap_inh" "$cap_prm" "$cap_eff" "$cap_amb" "$no_new_privs"
+            /usr/bin/printf 'CapBnd_DIAGNOSTIC=%s\n' "$cap_bnd"
+          } >"$normal_dir/identity-capability-proof.txt"
+          /usr/bin/awk '
+            $5 == "/proc" {
+              separator=0
+              for (field=7; field<=NF; field++) if ($field == "-") { separator=field; break }
+              split($6, options, ",")
+              nosuid=nodev=noexec=0
+              for (option in options) {
+                if (options[option] == "nosuid") nosuid=1
+                if (options[option] == "nodev") nodev=1
+                if (options[option] == "noexec") noexec=1
+              }
+              if (separator && $(separator+1) == "proc" && nosuid && nodev && noexec) passed=1
+            }
+            END { if (!passed) exit 1 }
+          ' "$mountinfo_file"
+          child_proc_mount_id=$(/usr/bin/awk '$5 == "/proc" { print $1; exit }' "$mountinfo_file")
+          parent_proc_mount_id=$(/usr/bin/awk '$5 == "/proc" { print $1; exit }' "/proc/$parent_pid_arg/mountinfo")
+          [ -n "$child_proc_mount_id" ]
+          [ -n "$parent_proc_mount_id" ]
+          [ "$child_proc_mount_id" != "$parent_proc_mount_id" ]
+          /usr/bin/printf 'PROC_MOUNTINFO=PASS\nPROC_MOUNT_ID_DIFFERENT=PASS\nCHILD_PROC_MOUNT_ID=%s\nPARENT_PROC_MOUNT_ID=%s\n' \
+            "$child_proc_mount_id" "$parent_proc_mount_id" >"$normal_dir/proc-proof.txt"
+          set +e
+          /usr/bin/sudo -n -- /usr/bin/id -u >"$normal_dir/sudo-regain.stdout" 2>"$normal_dir/sudo-regain.stderr"
+          sudo_regain_status=$?
+          set -e
+          [ "$sudo_regain_status" -ne 0 ]
+          /usr/bin/printf '%s\n' 'SUDO_REGAIN=BLOCKED' >"$normal_dir/sudo-regain-proof.txt"
+          set +e
+          /usr/bin/nsenter --net="/proc/$parent_pid_arg/ns/net" -- /usr/bin/true \
+            >"$normal_dir/nsenter-net.stdout" 2>"$normal_dir/nsenter-net.stderr"
+          nsenter_net_status=$?
+          set -e
+          [ "$nsenter_net_status" -ne 0 ]
+          set +e
+          /usr/bin/nsenter --mount="/proc/$parent_pid_arg/ns/mnt" -- /usr/bin/true \
+            >"$normal_dir/nsenter-mnt.stdout" 2>"$normal_dir/nsenter-mnt.stderr"
+          nsenter_mnt_status=$?
+          set -e
+          [ "$nsenter_mnt_status" -ne 0 ]
+          /usr/bin/printf '%s\n' 'NSENTER_NET_REGAIN=BLOCKED' 'NSENTER_MNT_REGAIN=BLOCKED' \
+            >"$normal_dir/nsenter-regain-proof.txt"
+          set +e
+          /usr/bin/python3 "$normal_dir/tcp-client.py" 127.0.0.1 "$listener_port_arg" \
+            >"$normal_dir/child-listener.stdout" 2>"$normal_dir/child-listener.stderr"
+          child_listener_status=$?
+          set -e
+          [ "$child_listener_status" -ne 0 ]
+          set +e
+          /usr/bin/python3 "$normal_dir/tcp-client.py" 1.1.1.1 443 \
+            >"$normal_dir/child-public.stdout" 2>"$normal_dir/child-public.stderr"
+          child_public_status=$?
+          set -e
+          [ "$child_public_status" -ne 0 ]
+          /usr/bin/printf '%s\n' 'CHILD_LISTENER=BLOCKED' 'CHILD_PUBLIC_NUMERIC_NETWORK=BLOCKED' \
+            >"$normal_dir/network-proof.txt"
+          [ "$(/usr/bin/sha256sum "$normal_dir/fixture.txt" | /usr/bin/awk '{ print $1 }')" = "$fixture_hash_arg" ]
+          /usr/bin/printf '%s\n' 'fixed S5 child output' >"$normal_dir/child-output.txt"
+          /usr/bin/chmod 0600 "$normal_dir/child-output.txt"
+          /usr/bin/printf '%s\n' 'FIXTURE_READ_WRITE=PASS' >"$normal_dir/fixture-proof.txt"
+          SH
+
+            /usr/bin/cat >"$sdk_exit_script" <<'SH'
+          #!/bin/sh
+          set -eu
+          namespace_file=$1
+          /usr/bin/printf 'NET=%s\nMNT=%s\nUSER=%s\n' \
+            "$(/usr/bin/readlink /proc/self/ns/net)" \
+            "$(/usr/bin/readlink /proc/self/ns/mnt)" \
+            "$(/usr/bin/readlink /proc/self/ns/user)" >"$namespace_file"
+          /usr/bin/cat /proc/self/mountinfo >"$namespace_file.mountinfo"
+          exit 37
+          SH
+
+            /usr/bin/cat >"$sdk_term_script" <<'SH'
+          #!/bin/sh
+          set -eu
+          namespace_file=$1
+          /usr/bin/printf 'NET=%s\nMNT=%s\nUSER=%s\n' \
+            "$(/usr/bin/readlink /proc/self/ns/net)" \
+            "$(/usr/bin/readlink /proc/self/ns/mnt)" \
+            "$(/usr/bin/readlink /proc/self/ns/user)" >"$namespace_file"
+          /usr/bin/cat /proc/self/mountinfo >"$namespace_file.mountinfo"
+          kill -TERM $$
+          SH
+            /usr/bin/chmod 0700 -- "$sdk_normal_script" "$sdk_exit_script" "$sdk_term_script"
+          }
+
+          start_parent_listener() {
+            listener_port_file="$work_root/listener.port"
+            /usr/bin/python3 "$listener_script" "$listener_port_file" \
+              >"$evidence/listener.stdout" 2>"$evidence/listener.stderr" &
+            listener_pid=$!
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if [ -s "$listener_port_file" ]; then
+                break
+              fi
+              /bin/sleep 1
+            done
+            [ -s "$listener_port_file" ]
+            /bin/kill -0 "$listener_pid"
+            listener_port=$(/usr/bin/cat "$listener_port_file")
+            case "$listener_port" in
+              ''|*[!0-9]*) return 1 ;;
+            esac
+            /usr/bin/python3 "$client_script" 127.0.0.1 "$listener_port" \
+              >"$evidence/parent-listener-before.stdout" 2>"$evidence/parent-listener-before.stderr"
+            /usr/bin/printf 'PARENT_LISTENER_BEFORE=PASS\nPID=%s\nPORT=%s\n' \
+              "$listener_pid" "$listener_port" >"$evidence/parent-listener-proof.txt"
+          }
+
+          assert_no_lane_residue() {
+            lane=$1
+            lane_script=$2
+            namespace_file=$3
+            process_evidence="$evidence/$lane-process-residue.txt"
+            namespace_evidence="$evidence/$lane-namespace-residue.txt"
+            mount_evidence="$evidence/$lane-mount-residue.txt"
+            : >"$process_evidence"
+            : >"$namespace_evidence"
+            : >"$mount_evidence"
+            for cmdline in /proc/[0-9]*/cmdline; do
+              [ -r "$cmdline" ] || continue
+              if /usr/bin/grep -aF -- "$lane_script" "$cmdline" >>"$process_evidence" 2>/dev/null; then
+                return 1
+              fi
+            done
+            [ -s "$namespace_file" ] || return 1
+            while IFS='=' read -r namespace_kind namespace_identity; do
+              case "$namespace_kind" in
+                NET) namespace_leaf=net ;;
+                MNT) namespace_leaf=mnt ;;
+                USER) continue ;;
+                HOST_PROC_DEV|CHILD_PROC_DEV) continue ;;
+                *) return 1 ;;
+              esac
+              for namespace_link in /proc/[0-9]*/ns/$namespace_leaf; do
+                [ -r "$namespace_link" ] || continue
+                if current_namespace=$(/usr/bin/readlink "$namespace_link" 2>/dev/null); then
+                  if [ "$current_namespace" = "$namespace_identity" ]; then
+                    /usr/bin/printf 'LIVE_NAMESPACE_HOLDER=%s %s\n' \
+                      "$namespace_link" "$namespace_identity" >>"$namespace_evidence"
+                    return 1
+                  fi
+                fi
+              done
+            done <"$namespace_file"
+            for mountinfo in /proc/[0-9]*/mountinfo; do
+              [ -r "$mountinfo" ] || continue
+              if /usr/bin/grep -aF -- "$lane_script" "$mountinfo" >>"$mount_evidence" 2>/dev/null; then
+                return 1
+              fi
+            done
+            /usr/bin/printf '%s\n' 'PROCESS_RESIDUE=NONE' >>"$process_evidence"
+            /usr/bin/printf '%s\n' 'NAMESPACE_RESIDUE=NONE' >>"$namespace_evidence"
+            /usr/bin/printf '%s\n' 'MOUNT_RESIDUE_BASIS=NO_CHILD_MOUNT_NAMESPACE_HOLDER' >>"$mount_evidence"
+            /usr/bin/printf '%s\n' 'MOUNT_RESIDUE=NONE' >>"$mount_evidence"
+          }
+
+          verify_runner_owned_fixture() {
+            expected_output_hash=$(/usr/bin/printf '%s\n' 'fixed S5 child output' | /usr/bin/sha256sum | /usr/bin/awk '{ print $1 }')
+            [ "$(/usr/bin/stat -Lc '%u:%g:%a' -- "$sdk_normal_dir/fixture.txt")" = "$runner_uid:$runner_gid:600" ]
+            [ "$(sha256_of "$sdk_normal_dir/fixture.txt")" = "$fixture_hash" ]
+            [ "$(/usr/bin/stat -Lc '%u:%g:%a' -- "$sdk_normal_dir/child-output.txt")" = "$runner_uid:$runner_gid:600" ]
+            [ "$(sha256_of "$sdk_normal_dir/child-output.txt")" = "$expected_output_hash" ]
+            /usr/bin/printf '%s\n' 'RUNNER_OWNERSHIP=PASS' 'FIXTURE_HASH_AFTER=PASS' \
+              >"$evidence/fixture-host-proof.txt"
+          }
+
+          run_three_fixed_lanes() {
+            host_net=$(/usr/bin/readlink /proc/self/ns/net)
+            host_mnt=$(/usr/bin/readlink /proc/self/ns/mnt)
+            host_user=$(/usr/bin/readlink /proc/self/ns/user)
+            host_proc_dev=$(/usr/bin/stat -Lc '%d' /proc)
+            parent_pid=$$
+
+            revalidate_authorities normal "$sdk_normal_dir"
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/unshare --mount --net \
+              --mount-proc=/proc --propagation private \
+              --setgid "$runner_gid" --setuid "$runner_uid" -- \
+              /usr/bin/setpriv --no-new-privs --inh-caps=-all \
+              --ambient-caps=-all -- /bin/sh \
+              "$sdk_normal_script" "$runner_uid" "$runner_gid" "$host_net" \
+              "$host_mnt" "$host_user" "$host_proc_dev" "$fixture_hash" \
+              "$listener_port" "$parent_pid" "$sdk_normal_dir" \
+              >"$evidence/normal.stdout" 2>"$evidence/normal.stderr"
+            normal_status=$?
+            set -e
+            /usr/bin/printf 'NORMAL_STATUS=%s\n' "$normal_status" >"$evidence/normal.status"
+            [ "$normal_status" -eq 0 ]
+            /usr/bin/printf '%s\n' 'NORMAL_STATUS=0' >>"$result_file"
+            assert_no_lane_residue normal "$sdk_normal_script" "$sdk_normal_dir/namespaces.txt"
+            verify_runner_owned_fixture
+
+            revalidate_authorities exit37 "$sdk_exit_dir"
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/unshare --mount --net \
+              --mount-proc=/proc --propagation private \
+              --setgid "$runner_gid" --setuid "$runner_uid" -- \
+              /usr/bin/setpriv --no-new-privs --inh-caps=-all \
+              --ambient-caps=-all -- /bin/sh \
+              "$sdk_exit_script" "$sdk_exit_dir/namespaces.txt" \
+              >"$evidence/exit37.stdout" 2>"$evidence/exit37.stderr"
+            exit37_status=$?
+            set -e
+            /usr/bin/printf 'EXIT37_STATUS=%s\n' "$exit37_status" >"$evidence/exit37.status"
+            [ "$exit37_status" -eq 37 ]
+            /usr/bin/printf '%s\n' 'EXIT37_STATUS=37' >>"$result_file"
+            assert_no_lane_residue exit37 "$sdk_exit_script" "$sdk_exit_dir/namespaces.txt"
+
+            revalidate_authorities term143 "$sdk_term_dir"
+            set +e
+            /usr/bin/sudo -n -- /usr/bin/unshare --mount --net \
+              --mount-proc=/proc --propagation private \
+              --setgid "$runner_gid" --setuid "$runner_uid" -- \
+              /usr/bin/setpriv --no-new-privs --inh-caps=-all \
+              --ambient-caps=-all -- /bin/sh \
+              "$sdk_term_script" "$sdk_term_dir/namespaces.txt" \
+              >"$evidence/term143.stdout" 2>"$evidence/term143.stderr"
+            term143_status=$?
+            set -e
+            /usr/bin/printf 'SIGNAL143_STATUS=%s\n' "$term143_status" >"$evidence/term143.status"
+            [ "$term143_status" -eq 143 ]
+            /usr/bin/printf '%s\n' 'SIGNAL143_STATUS=143' >>"$result_file"
+            assert_no_lane_residue term143 "$sdk_term_script" "$sdk_term_dir/namespaces.txt"
+          }
+
+          verify_success_contract() {
+            for marker in \
+              AUTHORITY_REVALIDATION_BEFORE_normal=PASS \
+              AUTHORITY_REVALIDATION_BEFORE_exit37=PASS \
+              AUTHORITY_REVALIDATION_BEFORE_term143=PASS \
+              NORMAL_STATUS=0 EXIT37_STATUS=37 SIGNAL143_STATUS=143
+            do
+              /usr/bin/grep -Fx -- "$marker" "$result_file" >/dev/null || return 1
+            done
+            for required_file in \
+              runner-facts.txt sudo-version.txt sudo-policy-runner.stdout \
+              sudo-policy-runner.status sudo-policy-root-after-escalation.stdout \
+              sudo-policy-root-after-escalation.status \
+              loader-env-sanitization.status sudo-policy-files.txt \
+              identity-config.txt locked-inputs.txt \
+              authority-drift-rejection.txt drift-unshare.status drift-setpriv.status drift-loader.status \
+              authority-manifest.tsv authority-roots.tsv authority-manifest.sha256 authority-roots.sha256 \
+              normal.status exit37.status term143.status \
+              normal-process-residue.txt exit37-process-residue.txt term143-process-residue.txt \
+              normal-namespace-residue.txt exit37-namespace-residue.txt term143-namespace-residue.txt \
+              normal-mount-residue.txt exit37-mount-residue.txt term143-mount-residue.txt \
+              fixture-host-proof.txt parent-listener-proof.txt
+            do
+              [ -s "$evidence/$required_file" ] || return 1
+            done
+            [ -f "$evidence/loader-env-sanitization.ld-matches" ] || return 1
+            [ ! -s "$evidence/loader-env-sanitization.ld-matches" ] || return 1
+            /usr/bin/grep -Fx 'PROCESS_RESIDUE=NONE' "$evidence/normal-process-residue.txt" >/dev/null
+            /usr/bin/grep -Fx 'NAMESPACE_RESIDUE=NONE' "$evidence/normal-namespace-residue.txt" >/dev/null
+            /usr/bin/grep -Fx 'MOUNT_RESIDUE=NONE' "$evidence/normal-mount-residue.txt" >/dev/null
+            drift_result_marker=AUTHORITY_DRIFT_REJECTION
+            /usr/bin/grep -Fx "$drift_result_marker=PASS" "$evidence/authority-drift-rejection.txt" >/dev/null
+            loader_env_result_marker=LOADER_ENV_SANITIZATION
+            /usr/bin/grep -Fx 'LOADER_ENV_MATCH_STATUS=1' "$evidence/loader-env-sanitization.status" >/dev/null
+            /usr/bin/grep -Fx "${loader_env_result_marker}_STATUS=0" "$evidence/loader-env-sanitization.status" >/dev/null
+            /usr/bin/grep -Fx "$loader_env_result_marker=PASS" "$evidence/loader-env-sanitization.status" >/dev/null
+            sudo_policy_runner_marker=SUDO_POLICY_RUNNER_STATUS
+            sudo_policy_root_marker=SUDO_POLICY_ROOT_AFTER_ESCALATION_STATUS
+            /usr/bin/grep -Fx "$sudo_policy_runner_marker=0" "$result_file" >/dev/null
+            /usr/bin/grep -Fx "$sudo_policy_root_marker=0" "$result_file" >/dev/null
+            [ -s "$evidence/sudoers-plugin-"identity.txt ]
+            [ -s "$sdk_normal_dir/mountinfo.txt" ]
+            [ -s "$sdk_normal_dir/status.txt" ]
+          }
+
+          runner_uid=$(/usr/bin/id -u)
+          runner_gid=$(/usr/bin/id -g)
+          [ -n "$runner_uid" ]
+          [ -n "$runner_gid" ]
+          [ "$(/usr/bin/stat -Lc '%a' -- "$evidence")" = 700 ]
+          [ "$(/usr/bin/stat -Lc '%a' -- "$result_file")" = 600 ]
+          prepare_locked_inputs
+          write_support_and_lane_scripts
+          initialize_authorities
+          run_authority_drift_negatives
+          record_runner_facts
+          start_parent_listener
+          run_three_fixed_lanes
+          /usr/bin/python3 "$client_script" 127.0.0.1 "$listener_port" \
+            >"$evidence/parent-listener-after.stdout" 2>"$evidence/parent-listener-after.stderr"
+          /usr/bin/printf '%s\n' 'PARENT_LISTENER_AFTER=PASS' >>"$evidence/parent-listener-proof.txt"
+          /usr/bin/printf '%s\n' 'PARENT_LISTENER_AFTER=PASS' >>"$result_file"
+          verify_success_contract
+
+      - name: Upload runner-authority evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: taoistfuchen-s5-runner-authorities-r4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runner-authority-s5-r4
+          if-no-files-found: error
+          retention-days: 7
